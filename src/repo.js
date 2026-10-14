@@ -95,6 +95,39 @@ export async function loadRepo(storage, did, keypair, rootCid) {
   return await Repo.load(storage, CID.parse(rootCid));
 }
 
+// --- Repo write serialization ---
+// Every write loads the current root, applies its ops and commits a new root.
+// Without serialization, two concurrent writes build on the same parent and
+// the later one silently drops the earlier one (and breaks the firehose
+// commit chain). This is a single-process mutex, which is sufficient as long
+// as the PDS runs as a single dyno/instance.
+const REPO_LOCK_MAX_HOLD_MS = 30_000; // Heroku's request timeout
+let repoLockTail = Promise.resolve();
+
+/** Resolves to an idempotent release() function once the lock is held. */
+export function acquireRepoWriteLock() {
+  let releaseNext;
+  const held = new Promise((resolve) => { releaseNext = resolve; });
+  const previous = repoLockTail;
+  repoLockTail = previous.then(() => held);
+
+  return previous.then(() => {
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      clearTimeout(timer);
+      releaseNext();
+    };
+    const timer = setTimeout(() => {
+      console.warn('[REPO_LOCK] Write lock held too long; force-releasing');
+      release();
+    }, REPO_LOCK_MAX_HOLD_MS);
+    timer.unref?.();
+    return release;
+  });
+}
+
 export const getRootCid = async () => {
   try {
     const res = await db.execute({

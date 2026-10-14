@@ -2,7 +2,7 @@ import express from 'express';
 import { db, destroy } from './db.js';
 import * as cbor from '@ipld/dag-cbor';
 import { sequencer } from './sequencer.js';
-import { setUpRepo, getRootCid } from './repo.js';
+import { setUpRepo, getRootCid, acquireRepoWriteLock } from './repo.js';
 import { escapeHtml, verifyPassword } from './util.js';
 import { getLoginUrl } from './session.js';
 import { buildFedCmAccount, getConfigUrl } from './fedcm.js';
@@ -473,10 +473,16 @@ router.post('/debug/reset', requireBrowserSession, async (req, res) => {
     }
 
     console.log('Wiping ALL PDS data via Web UI...');
-    await destroy();
-    
-    // Re-initialize an empty repo so the PDS remains in a valid state
-    await setUpRepo();
+    // Don't interleave the wipe with in-flight repo writes.
+    const release = await acquireRepoWriteLock();
+    try {
+      await destroy();
+      
+      // Re-initialize an empty repo so the PDS remains in a valid state
+      await setUpRepo();
+    } finally {
+      release();
+    }
     
     res.send('<h1>Success</h1><p>PDS has been wiped clean and re-initialized.</p><a href="/">Back to Dashboard</a>');
 });

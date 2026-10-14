@@ -2,7 +2,7 @@ import express from 'express';
 import path from 'path';
 import { db } from './db.js';
 import { createToken, verifyToken, validateDpop, getJkt, createServiceAuthToken, auth, oauth } from './auth.js';
-import { TursoStorage, getRootCid, setUpRepo } from './repo.js';
+import { TursoStorage, getRootCid, setUpRepo, acquireRepoWriteLock } from './repo.js';
 import { Repo, WriteOpAction, blocksToCarFile } from '@atproto/repo';
 import * as crypto from '@atproto/crypto';
 import { createHash, randomBytes, createPublicKey, createECDH } from 'crypto';
@@ -75,6 +75,24 @@ const writeLimiter = rateLimit({
 app.use(cors);
 
 app.use(globalLimiter);
+
+// Serializes repo writes for the lifetime of the request (see acquireRepoWriteLock),
+// and re-reads the repo root once the lock is held, since the root captured by
+// the user-context middleware may be stale by then.
+const repoWriteLock = async (req, res, next) => {
+  const release = await acquireRepoWriteLock();
+  res.once('finish', release);
+  res.once('close', release);
+  try {
+    const root = await getRootCid();
+    if (!root) throw new Error('Repository not initialized');
+    req.user.root_cid = root.toString();
+    next();
+  } catch (err) {
+    release();
+    next(err);
+  }
+};
 
 export const wss = new WebSocketServer({ noServer: true });
 
@@ -417,7 +435,7 @@ app.post('/xrpc/app.bsky.actor.putPreferences', auth, oauth('atproto'), async (r
   res.json({});
 });
 
-app.post('/xrpc/com.atproto.repo.createRecord', writeLimiter, auth, oauth('atproto'), async (req, res) => {
+app.post('/xrpc/com.atproto.repo.createRecord', writeLimiter, auth, oauth('atproto'), repoWriteLock, async (req, res) => {
     const { repo, collection, record, rkey } = req.body;
     if (repo !== req.user.did) return res.status(403).json({ error: 'InvalidRepo' });
     
@@ -463,7 +481,7 @@ app.post('/xrpc/com.atproto.repo.createRecord', writeLimiter, auth, oauth('atpro
     });
 });
 
-app.post('/xrpc/com.atproto.repo.putRecord', writeLimiter, auth, oauth('atproto'), async (req, res) => {
+app.post('/xrpc/com.atproto.repo.putRecord', writeLimiter, auth, oauth('atproto'), repoWriteLock, async (req, res) => {
   const { repo, collection, rkey, record } = req.body;
   if (repo !== req.user.did) return res.status(403).json({ error: 'InvalidRepo' });
 
@@ -505,7 +523,7 @@ app.post('/xrpc/com.atproto.repo.putRecord', writeLimiter, auth, oauth('atproto'
   });
 });
 
-app.post('/xrpc/com.atproto.repo.deleteRecord', writeLimiter, auth, oauth('atproto'), async (req, res) => {
+app.post('/xrpc/com.atproto.repo.deleteRecord', writeLimiter, auth, oauth('atproto'), repoWriteLock, async (req, res) => {
   const { repo, collection, rkey } = req.body;
   if (repo !== req.user.did) return res.status(403).json({ error: 'InvalidRepo' });
   
@@ -536,7 +554,7 @@ app.post('/xrpc/com.atproto.repo.deleteRecord', writeLimiter, auth, oauth('atpro
   res.json({ commit: { cid: updatedRepo.cid.toString(), rev: updatedRepo.commit.rev } });
 });
 
-app.post('/xrpc/com.atproto.repo.applyWrites', writeLimiter, auth, oauth('atproto'), async (req, res) => {
+app.post('/xrpc/com.atproto.repo.applyWrites', writeLimiter, auth, oauth('atproto'), repoWriteLock, async (req, res) => {
   const { repo, writes } = req.body;
   if (repo !== req.user.did) return res.status(403).json({ error: 'InvalidRepo' });
 

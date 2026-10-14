@@ -651,9 +651,20 @@ app.get('/xrpc/com.atproto.repo.listRecords', async (req, res, next) => {
 
 app.get('/xrpc/com.atproto.repo.getRecord', async (req, res, next) => {
   const { repo, collection, rkey } = req.query;
+  const isLocalRepo = typeof repo === 'string' &&
+    (repo.toLowerCase() === req.user.did.toLowerCase() || repo.toLowerCase() === req.user.handle.toLowerCase());
+  // Not our repo: let it fall through (e.g. to the proxy).
+  if (!isLocalRepo) return next();
+
   const record = await getRecordHelper(repo, collection, rkey, req.user);
-  
-  if (!record) return next();
+  if (!record) {
+    // Match the reference PDS: a missing record in our own repo is a 400 RecordNotFound,
+    // not a 404 MethodNotFound (clients check for this error name).
+    return res.status(400).json({
+      error: 'RecordNotFound',
+      message: `Could not locate record: at://${req.user.did}/${collection}/${rkey}`
+    });
+  }
   
   res.json({ uri: `at://${repo}/${collection}/${rkey}`, value: record.value, cid: record.cid });
 });

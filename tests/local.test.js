@@ -134,11 +134,13 @@ describe('PDS Local Tests', () => {
     });
     expect(deleteRes.success).toBe(true);
 
+    // Missing records in our own repo must surface as the lexicon-defined
+    // RecordNotFound error (HTTP 400), like the reference PDS, not a 404.
     await expect(agent.api.com.atproto.repo.getRecord({
       repo: agent.session?.did,
       collection: 'app.bsky.feed.post',
       rkey: rkey,
-    })).rejects.toThrow();
+    })).rejects.toMatchObject({ status: 400, error: 'RecordNotFound' });
   });
 
   test('should describe server', async () => {

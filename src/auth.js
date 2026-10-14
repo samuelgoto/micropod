@@ -3,6 +3,22 @@ import { createHash, createPublicKey, createPrivateKey, createECDH, verify as cr
 import * as cryptoAtp from '@atproto/crypto';
 import { secp256k1 } from '@noble/curves/secp256k1';
 import { getOauthEs256kKeypair, getOauthEs256kPrivateKeyHex } from './oauth-keys.js';
+import { isAppSessionActive, REFRESH_SCOPE } from './app-sessions.js';
+
+/**
+ * Signs an arbitrary JWT payload with the OAuth ES256K key (the same key that
+ * verifyToken() checks first).
+ */
+export async function signJwt(payload) {
+  const header = { typ: 'JWT', alg: 'ES256K' };
+  const headerB64 = Buffer.from(JSON.stringify(header)).toString('base64url');
+  const payloadB64 = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const data = Buffer.from(`${headerB64}.${payloadB64}`);
+
+  const keypair = await getOauthEs256kKeypair();
+  const sig = await keypair.sign(data);
+  return `${headerB64}.${payloadB64}.${Buffer.from(sig).toString('base64url')}`;
+}
 
 export async function createToken(did, handle) {
   const privKeyHex = getOauthEs256kPrivateKeyHex();
@@ -226,6 +242,8 @@ export function isUserAccessToken(payload) {
   // Session / OAuth access tokens always carry a scope; id_tokens and JARM
   // responses do not.
   if (typeof payload.scope !== 'string' || payload.scope.trim() === '') return false;
+  // Refresh tokens can only be used at refreshSession / deleteSession.
+  if (payload.scope === REFRESH_SCOPE) return false;
   return true;
 }
 
@@ -274,6 +292,11 @@ export const auth = async (req, res, next) => {
   if (payload.cnf) {
     console.log(`Auth failed: DPoP-bound token used without DPoP for ${req.url}`);
     return res.status(401).json({ error: 'InvalidToken', message: 'DPoP-bound token requires DPoP authorization' });
+  }
+  // App-session access tokens are revoked as soon as their session is deleted.
+  if (payload.sid && !(await isAppSessionActive(payload.sid))) {
+    console.log(`Auth failed: Session revoked or expired for ${req.url}`);
+    return res.status(401).json({ error: 'ExpiredToken', message: 'Session has been revoked or expired' });
   }
   if (!req.user) req.user = {};
   req.user.auth = payload;

@@ -22,6 +22,7 @@ import helmet from 'helmet';
 import fedcmRouter from './fedcm.js';
 import loginRouter from './login.js';
 import { attachSession } from './session.js';
+import { createAppSession, refreshAppSession, deleteAppSession } from './app-sessions.js';
 import { fileURLToPath } from 'url';
 
 const app = express();
@@ -284,15 +285,54 @@ app.post('/xrpc/com.atproto.server.createSession', authLimiter, async (req, res)
     return res.status(401).json({ error: 'InvalidPassword' });
   }
 
-  const accessJwt = await createToken(user.did, user.handle);  res.json({ accessJwt, refreshJwt: accessJwt, handle: user.handle, did: user.did });
+  const { accessJwt, refreshJwt } = await createAppSession(user.did, user.handle);
+  const didDoc = await getDidDoc(user, user.host);
+  res.json({
+    accessJwt,
+    refreshJwt,
+    handle: user.handle,
+    did: user.did,
+    didDoc,
+    email: user.email,
+    emailConfirmed: true,
+    active: true,
+  });
 });
 
-app.post('/xrpc/com.atproto.server.refreshSession', authLimiter, auth, async (req, res) => {
-  const user = req.user;
-  if (!user) return res.status(500).json({ error: 'ServerNotInitialized' });
-  
-  const accessJwt = await createToken(user.auth.sub, user.auth.handle);
-  res.json({ accessJwt, refreshJwt: accessJwt, handle: user.auth.handle, did: user.auth.sub });
+const getBearerToken = (req) => {
+  const [type, token] = (req.headers.authorization || '').split(' ');
+  return type === 'Bearer' && token ? token : null;
+};
+
+app.post('/xrpc/com.atproto.server.refreshSession', authLimiter, async (req, res) => {
+  const token = getBearerToken(req);
+  if (!token) return res.status(401).json({ error: 'AuthenticationRequired' });
+
+  const session = await refreshAppSession(token);
+  if (!session) {
+    console.log('refreshSession failed: invalid, expired, or revoked refresh token');
+    return res.status(401).json({ error: 'InvalidToken', message: 'Token could not be verified' });
+  }
+
+  const didDoc = await getDidDoc(req.user, req.user.host);
+  res.json({
+    accessJwt: session.accessJwt,
+    refreshJwt: session.refreshJwt,
+    handle: session.handle,
+    did: session.did,
+    didDoc,
+    active: true,
+  });
+});
+
+app.post('/xrpc/com.atproto.server.deleteSession', authLimiter, async (req, res) => {
+  const token = getBearerToken(req);
+  if (!token) return res.status(401).json({ error: 'AuthenticationRequired' });
+
+  if (!(await deleteAppSession(token))) {
+    return res.status(401).json({ error: 'InvalidToken', message: 'Token could not be verified' });
+  }
+  res.json({});
 });
 
 app.get('/xrpc/com.atproto.server.getAccount', auth, oauth('atproto'), async (req, res) => {

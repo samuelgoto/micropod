@@ -67,6 +67,17 @@ export async function create() {
       client_id TEXT NOT NULL,
       request_data TEXT NOT NULL,
       expires_at INTEGER NOT NULL
+    )`,
+    // Legacy app sessions (createSession/refreshSession/deleteSession). See app-sessions.js.
+    `CREATE TABLE IF NOT EXISTS app_sessions (
+      sid TEXT PRIMARY KEY,
+      did TEXT NOT NULL,
+      handle TEXT NOT NULL,
+      refresh_jti TEXT NOT NULL,
+      prev_refresh_jti TEXT,
+      prev_valid_until INTEGER,
+      created_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL
     )`
   ], "write");
 
@@ -103,6 +114,7 @@ export async function destroy() {
     'DELETE FROM preferences',
     'DELETE FROM oauth_codes',
     'DELETE FROM oauth_refresh_tokens',
-    'DELETE FROM oauth_par_requests'
+    'DELETE FROM oauth_par_requests',
+    'DELETE FROM app_sessions'
   ], "write");
 }

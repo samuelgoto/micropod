@@ -1,9 +1,9 @@
 import express from 'express';
 import { db } from './db.js';
 import { createToken, validateDpop, verifyToken } from './auth.js';
-import { createHash, randomBytes, createECDH, createPublicKey } from 'crypto';
+import { createHash, createHmac, randomBytes, createECDH, createPublicKey, timingSafeEqual } from 'crypto';
 import axios from 'axios';
-import { getDidDoc, verifyPassword, isSafeUrl } from './util.js';
+import { getDidDoc, verifyPassword, isSafeUrl, escapeHtml } from './util.js';
 import { rateLimit } from 'express-rate-limit';
 import jwt from 'jsonwebtoken';
 import { createSession, getLoginUrl, setSessionCookie } from './session.js';
@@ -118,9 +118,38 @@ export async function createIdToken(did, handle, client_id, issuer) {
   return `${headerB64}.${payloadB64}.${sigB64}`;
 }
 
+// Schemes that must never be accepted as an OAuth redirect target (they would
+// execute script in our origin when used in links / redirects).
+const FORBIDDEN_REDIRECT_SCHEMES = new Set(['javascript:', 'data:', 'vbscript:', 'file:', 'blob:']);
+
+export const isAllowedRedirectUri = (value) => {
+  if (typeof value !== 'string' || value.length === 0) return false;
+  try {
+    const url = new URL(value);
+    return !FORBIDDEN_REDIRECT_SCHEMES.has(url.protocol);
+  } catch {
+    return false;
+  }
+};
+
+// Only allow http(s) URLs to be rendered as links/images on the consent page.
+const safeHttpUrl = (value) => {
+  if (typeof value !== 'string') return '';
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' || url.protocol === 'http:' ? url.toString() : '';
+  } catch {
+    return '';
+  }
+};
+
+/**
+ * Fetches and validates OAuth client metadata. Returns null on ANY failure;
+ * callers MUST treat null as "reject the request" (fail closed).
+ */
 const validateClient = async (client_id, redirect_uri) => {
   try {
-    if (!isSafeUrl(client_id)) {
+    if (typeof client_id !== 'string' || !isSafeUrl(client_id)) {
       throw new Error('SSRF Blocked: Invalid or unsafe client_id URL.');
     }
 
@@ -131,9 +160,20 @@ const validateClient = async (client_id, redirect_uri) => {
     });
     
     const metadata = res.data;
-    if (redirect_uri && (!metadata.redirect_uris || !metadata.redirect_uris.includes(redirect_uri))) {
-      console.warn(`[OAUTH] Redirect URI mismatch for ${client_id}. Expected one of: ${metadata.redirect_uris}`);
-      throw new Error('Invalid redirect_uri');
+    if (!metadata || typeof metadata !== 'object') {
+      throw new Error('Client metadata is not a JSON object');
+    }
+    if (metadata.client_id && metadata.client_id !== client_id) {
+      throw new Error(`client_id mismatch in metadata: ${metadata.client_id}`);
+    }
+    if (redirect_uri !== undefined) {
+      if (!isAllowedRedirectUri(redirect_uri)) {
+        throw new Error('Forbidden redirect_uri scheme');
+      }
+      if (!Array.isArray(metadata.redirect_uris) || !metadata.redirect_uris.includes(redirect_uri)) {
+        console.warn(`[OAUTH] Redirect URI mismatch for ${client_id}. Expected one of: ${metadata.redirect_uris}`);
+        throw new Error('Invalid redirect_uri');
+      }
     }
     return metadata;
   } catch (err) {
@@ -142,10 +182,41 @@ const validateClient = async (client_id, redirect_uri) => {
   }
 };
 
+// --- CSRF protection for browser-session approvals ---
+// The pds_session cookie is SameSite=None (needed for FedCM), so a browser
+// session alone must never be enough to approve a grant. Approvals that rely
+// on the session must come from our own origin and carry a token bound to it.
+const csrfTokenForSession = (sessionId) => createHmac('sha256', getOauthEs256kPrivateKeyHex() || 'csrf')
+  .update(`oauth-authorize-csrf:${sessionId}`)
+  .digest('base64url');
+
+const isValidCsrfToken = (sessionId, token) => {
+  if (!sessionId || typeof token !== 'string') return false;
+  const expected = Buffer.from(csrfTokenForSession(sessionId));
+  const actual = Buffer.from(token);
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+};
+
+const isSameOriginRequest = (req) => {
+  const expectedOrigin = new URL(req.user.issuer).origin;
+  const origin = req.get('origin');
+  if (origin) return origin === expectedOrigin;
+  const referer = req.get('referer');
+  if (referer) {
+    try { return new URL(referer).origin === expectedOrigin; } catch { return false; }
+  }
+  return false;
+};
+
+const sendAuthorizeError = (res, status, message) => {
+  res.status(status).type('text/plain').send(message);
+};
+
 router.post('/oauth/par', async (req, res) => {
   const { client_id, redirect_uri } = req.body;
-  if (redirect_uri) {
-    await validateClient(client_id, redirect_uri);
+  const metadata = await validateClient(client_id, redirect_uri ?? '');
+  if (!metadata) {
+    return res.status(400).json({ error: 'invalid_request', error_description: 'Invalid client_id or redirect_uri' });
   }
   const request_uri = `urn:ietf:params:oauth:request_uri:${randomBytes(16).toString('hex')}`;
   const expires_at = Math.floor(Date.now() / 1000) + 600; // 10 mins
@@ -165,24 +236,30 @@ router.get('/oauth/authorize', async (req, res) => {
       sql: 'SELECT request_data FROM oauth_par_requests WHERE request_uri = ? AND expires_at > ?',
       args: [query.request_uri, Math.floor(Date.now() / 1000)]
     });
-    if (par.rows.length > 0) {
-      query = JSON.parse(par.rows[0].request_data);
+    if (par.rows.length === 0) {
+      return sendAuthorizeError(res, 400, 'Unknown or expired request_uri');
     }
+    query = JSON.parse(par.rows[0].request_data);
   }
 
   const { client_id, redirect_uri, scope, state, code_challenge, code_challenge_method, response_mode } = query;
-  
-  let metadata = null;
-  if (client_id.startsWith('http')) {
-    metadata = await validateClient(client_id, redirect_uri);
+  if (typeof client_id !== 'string' || typeof redirect_uri !== 'string') {
+    return sendAuthorizeError(res, 400, 'Missing client_id or redirect_uri');
   }
 
-  const clientName = metadata?.client_name || client_id;
-  const logoUri = metadata?.logo_uri || '';
+  // Fail closed: never render a consent screen (or redirect anywhere) for a
+  // client whose metadata / redirect_uri could not be validated.
+  const metadata = await validateClient(client_id, redirect_uri);
+  if (!metadata) {
+    return sendAuthorizeError(res, 400, 'Invalid client_id or redirect_uri');
+  }
+
+  const clientName = (typeof metadata.client_name === 'string' && metadata.client_name) || client_id;
+  const logoUri = safeHttpUrl(metadata.logo_uri);
   const isBrowserLoggedIn = Boolean(req.session);
 
-  if (metadata?.authorization_signed_response_alg && !getSupportedAuthorizationSigningAlgs().includes(metadata.authorization_signed_response_alg)) {
-    return res.status(400).send(`Unsupported authorization_signed_response_alg: ${metadata.authorization_signed_response_alg}`);
+  if (metadata.authorization_signed_response_alg && !getSupportedAuthorizationSigningAlgs().includes(metadata.authorization_signed_response_alg)) {
+    return sendAuthorizeError(res, 400, `Unsupported authorization_signed_response_alg: ${metadata.authorization_signed_response_alg}`);
   }
 
   if (!isBrowserLoggedIn) {
@@ -190,8 +267,16 @@ router.get('/oauth/authorize', async (req, res) => {
     return res.redirect(getLoginUrl(returnTo, { autoReturn: true }));
   }
 
+  const cancelUrl = new URL(redirect_uri);
+  cancelUrl.searchParams.set('error', 'access_denied');
+  if (state) cancelUrl.searchParams.set('state', state);
+  cancelUrl.searchParams.set('iss', req.user.issuer);
+
+  const csrfToken = csrfTokenForSession(req.session.id);
+  const h = escapeHtml;
+
   const getScopeDescription = (s) => {
-    const scopes = s.split(' ');
+    const scopes = String(s).split(' ');
     return scopes.map(scopeStr => {
       // Handle Resource Indicators (e.g. scope?aud=...)
       const [scope] = scopeStr.split('?');
@@ -208,9 +293,9 @@ router.get('/oauth/authorize', async (req, res) => {
         // ATProto nuance: Clients can provide descriptions for these in their metadata
         const desc = metadata?.scope_descriptions?.[macroName] || metadata?.atproto_scope_descriptions?.[macroName];
         if (desc) {
-          return `<li><strong>${macroName}</strong>: ${desc}</li>`;
+          return `<li><strong>${h(macroName)}</strong>: ${h(desc)}</li>`;
         }
-        return `<li><strong>${macroName}</strong>: Additional application-specific permission.</li>`;
+        return `<li><strong>${h(macroName)}</strong>: Additional application-specific permission.</li>`;
       }
 
       // Handle repo: parameterized scopes
@@ -218,10 +303,10 @@ router.get('/oauth/authorize', async (req, res) => {
         const params = new URLSearchParams(scopeStr.split('?')[1] || '');
         const collection = params.get('collection');
         const action = params.get('action') || 'all';
-        return `<li><strong>Repository</strong>: ${action} records in <code>${collection || 'all collections'}</code>.</li>`;
+        return `<li><strong>Repository</strong>: ${h(action)} records in <code>${h(collection || 'all collections')}</code>.</li>`;
       }
 
-      return `<li><strong>${scope}</strong>: Additional permission.</li>`;
+      return `<li><strong>${h(scope)}</strong>: Additional permission.</li>`;
     }).join('');
   };
 
@@ -373,38 +458,39 @@ router.get('/oauth/authorize', async (req, res) => {
         <p class="eyebrow">Authorize application access</p>
         <div class="header">
           <div class="logo">
-            ${logoUri ? `<img src="${logoUri}" alt="">` : clientName[0].toUpperCase()}
+            ${logoUri ? `<img src="${h(logoUri)}" alt="">` : h(clientName[0].toUpperCase())}
           </div>
           <div>
-            <h1>${clientName}</h1>
-            <div class="client-id">${client_id}</div>
+            <h1>${h(clientName)}</h1>
+            <div class="client-id">${h(client_id)}</div>
           </div>
         </div>
         
-        <p>${clientName} wants to access your <strong>${req.user.handle}</strong> account.</p>
+        <p>${h(clientName)} wants to access your <strong>${h(req.user.handle)}</strong> account.</p>
         
         <div class="scope-list">
           <ul>${getScopeDescription(scope || 'atproto')}</ul>
         </div>
 
         <form method="POST" action="/oauth/authorize">
-          <input type="hidden" name="client_id" value="${client_id}">
-          <input type="hidden" name="redirect_uri" value="${redirect_uri}">
-          <input type="hidden" name="scope" value="${scope}">
-          <input type="hidden" name="state" value="${state}">
-          <input type="hidden" name="code_challenge" value="${code_challenge}">
-          <input type="hidden" name="code_challenge_method" value="${code_challenge_method || ''}">
-          <input type="hidden" name="response_mode" value="${response_mode || ''}">
+          <input type="hidden" name="csrf_token" value="${h(csrfToken)}">
+          <input type="hidden" name="client_id" value="${h(client_id)}">
+          <input type="hidden" name="redirect_uri" value="${h(redirect_uri)}">
+          <input type="hidden" name="scope" value="${h(scope ?? '')}">
+          <input type="hidden" name="state" value="${h(state ?? '')}">
+          <input type="hidden" name="code_challenge" value="${h(code_challenge ?? '')}">
+          <input type="hidden" name="code_challenge_method" value="${h(code_challenge_method || '')}">
+          <input type="hidden" name="response_mode" value="${h(response_mode || '')}">
           <div class="actions">
             <button type="submit">Authorize</button>
-            <a class="link-button" href="${redirect_uri}?error=access_denied">Cancel</a>
+            <a class="link-button" href="${h(cancelUrl.toString())}">Cancel</a>
           </div>
         </form>
         
         <div class="meta-links">
-          ${metadata?.client_uri ? `<a href="${metadata.client_uri}" target="_blank">About the Application</a>` : ''}
-          ${metadata?.policy_uri ? `<a href="${metadata.policy_uri}" target="_blank">Privacy Policy</a>` : ''}
-          ${metadata?.tos_uri ? `<a href="${metadata.tos_uri}" target="_blank">Terms of Service</a>` : ''}
+          ${safeHttpUrl(metadata.client_uri) ? `<a href="${h(safeHttpUrl(metadata.client_uri))}" target="_blank" rel="noopener noreferrer">About the Application</a>` : ''}
+          ${safeHttpUrl(metadata.policy_uri) ? `<a href="${h(safeHttpUrl(metadata.policy_uri))}" target="_blank" rel="noopener noreferrer">Privacy Policy</a>` : ''}
+          ${safeHttpUrl(metadata.tos_uri) ? `<a href="${h(safeHttpUrl(metadata.tos_uri))}" target="_blank" rel="noopener noreferrer">Terms of Service</a>` : ''}
         </div>
       </div>
     </body>
@@ -413,12 +499,44 @@ router.get('/oauth/authorize', async (req, res) => {
 });
 
 router.post('/oauth/authorize', oauthLimiter, async (req, res) => {
-  const { client_id, redirect_uri, scope, state, code_challenge, code_challenge_method, response_mode, password } = req.body;
+  const { client_id, redirect_uri, scope, state, code_challenge, code_challenge_method, response_mode, password, csrf_token } = req.body;
   const user = req.user;
-
-  const hasBrowserSession = Boolean(req.session);
-  if (!user || (!hasBrowserSession && !verifyPassword(password, user.password))) {
+  if (!user) {
     return res.status(401).send('Invalid password');
+  }
+
+  // Two ways to approve a grant:
+  //  1. The account password is supplied with the request (cannot be forged cross-site).
+  //  2. An existing browser session, BUT only from our own consent page: the
+  //     request must be same-origin and carry the CSRF token bound to the session.
+  //     (The session cookie is SameSite=None, so it is sent on cross-site POSTs.)
+  const passwordOk = typeof password === 'string' && password.length > 0 && verifyPassword(password, user.password);
+  const hasBrowserSession = Boolean(req.session);
+  if (!passwordOk) {
+    if (!hasBrowserSession) {
+      return res.status(401).send('Invalid password');
+    }
+    if (!isSameOriginRequest(req) || !isValidCsrfToken(req.session.id, csrf_token)) {
+      console.warn('[OAUTH] Rejected cross-site or tokenless authorization approval', {
+        origin: req.get('origin') || null,
+        referer: req.get('referer') || null,
+        client_id,
+      });
+      return sendAuthorizeError(res, 403, 'Authorization must be approved from the consent screen');
+    }
+  }
+
+  // ATProto OAuth requires PKCE with S256.
+  if (typeof code_challenge !== 'string' || code_challenge.length < 43 || code_challenge_method !== 'S256') {
+    return sendAuthorizeError(res, 400, 'PKCE (S256 code_challenge) is required');
+  }
+
+  // 1. Validate client and get metadata for JARM check. Fail closed: never
+  //    issue a code or redirect to an unvalidated redirect_uri.
+  const metadata = await validateClient(client_id, redirect_uri ?? '');
+  console.log(`[OAUTH] Metadata for ${client_id}:`, metadata);
+  if (!metadata) {
+    return sendAuthorizeError(res, 400, 'Invalid client_id or redirect_uri');
   }
 
   if (!hasBrowserSession) {
@@ -426,11 +544,7 @@ router.post('/oauth/authorize', oauthLimiter, async (req, res) => {
     setSessionCookie(res, sessionId);
   }
 
-  // 1. Validate client and get metadata for JARM check
-  const metadata = await validateClient(client_id, redirect_uri);
-  console.log(`[OAUTH] Metadata for ${client_id}:`, metadata);
-
-  if (metadata?.authorization_signed_response_alg && !getSupportedAuthorizationSigningAlgs().includes(metadata.authorization_signed_response_alg)) {
+  if (metadata.authorization_signed_response_alg && !getSupportedAuthorizationSigningAlgs().includes(metadata.authorization_signed_response_alg)) {
     return res.status(400).json({
       error: 'invalid_request',
       message: `Unsupported authorization_signed_response_alg: ${metadata.authorization_signed_response_alg}`
@@ -610,6 +724,19 @@ router.post('/oauth/token', oauthLimiter, async (req, res) => {
         console.log('[OAUTH_TOKEN] PKCE verification passed', { requestId, client_id });
       }
 
+      if (row.format !== 'indieauth') {
+        // ATProto OAuth: PKCE and DPoP are mandatory, and redirect_uri must match.
+        if (!row.dpop_jwk) {
+          return res.status(400).json({ error: 'invalid_grant', message: 'Authorization code was not PKCE-bound' });
+        }
+        if (!jkt) {
+          return res.status(400).json({ error: 'invalid_dpop_proof', message: 'DPoP proof is required' });
+        }
+        if (redirect_uri && row.redirect_uri && redirect_uri !== row.redirect_uri) {
+          return res.status(400).json({ error: 'invalid_grant', message: 'redirect_uri mismatch' });
+        }
+      }
+
       if (row.format === 'indieauth') {
         const accessToken = await createToken(row.did, user.handle);
         let profile = {};
@@ -674,7 +801,7 @@ router.post('/oauth/token', oauthLimiter, async (req, res) => {
       }
 
       const row = result.rows[0];
-      if ((row.dpop_jwk || '') !== (jkt || '')) {
+      if (!jkt || (row.dpop_jwk || '') !== jkt) {
         return res.status(400).json({ error: 'invalid_dpop_key' });
       }
 

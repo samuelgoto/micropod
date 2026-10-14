@@ -20,6 +20,9 @@ const __dirname = path.dirname(__filename);
 const PORT = 3008;
 const HOST = `http://localhost:${PORT}`;
 const HANDLE_VAR = `localhost`;
+// A syntactically valid S256 PKCE challenge (ATProto OAuth requires PKCE S256).
+const VALID_PKCE_VERIFIER = 'test-verifier-0123456789-abcdefghijklmnopqrstuvwxyz';
+const VALID_PKCE_CHALLENGE = createHash('sha256').update(VALID_PKCE_VERIFIER).digest('base64url');
 
 
 /**
@@ -216,8 +219,9 @@ describe('ATProto OAuth Implementation Tests', () => {
       expect(authRes.data).toContain('Example Client');
       expect(authRes.data).toContain(client_id);
       expect(authRes.data).toContain('value="stream-place-state"');
-      // Nuance: Verify that the extensive scope is correctly passed through and handled in the form
-      expect(authRes.data).toContain('value="' + fullScope + '"');
+      // Nuance: Verify that the extensive scope is correctly passed through and handled in the form.
+      // Values are HTML-escaped in the form (the browser decodes them on submit).
+      expect(authRes.data).toContain('value="' + fullScope.replaceAll('&', '&amp;') + '"');
     });
 
     test('Authorize UI redirects anonymous browsers to /login', async () => {
@@ -839,7 +843,7 @@ describe('ATProto OAuth Implementation Tests', () => {
         redirect_uri,
         password,
         state: 'jarm-test',
-        code_challenge: 'any',
+        code_challenge: VALID_PKCE_CHALLENGE,
         code_challenge_method: 'S256'
       }).toString(), { maxRedirects: 0, validateStatus: s => s === 302 });
 
@@ -888,7 +892,7 @@ describe('ATProto OAuth Implementation Tests', () => {
           redirect_uri,
           password,
           state: 'jarm-rs256-supported-test',
-          code_challenge: 'any',
+          code_challenge: VALID_PKCE_CHALLENGE,
           code_challenge_method: 'S256'
         }).toString(), { maxRedirects: 0, validateStatus: s => s === 302 });
 
@@ -933,7 +937,7 @@ describe('ATProto OAuth Implementation Tests', () => {
         redirect_uri,
         password,
         state: 'jarm-rs256-test',
-        code_challenge: 'any',
+        code_challenge: VALID_PKCE_CHALLENGE,
         code_challenge_method: 'S256'
       }).toString(), {
         maxRedirects: 0,
@@ -971,11 +975,11 @@ describe('ATProto OAuth Implementation Tests', () => {
         })
         .get('/jwks.json').reply(200, jwks);
 
-      // 1. Create a fake code in DB
+      // 1. Create a fake (PKCE-bound) code in DB
       const code = 'secure-code';
       await db.execute({
         sql: 'INSERT INTO oauth_codes (code, client_id, redirect_uri, scope, did, dpop_jwk, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        args: [code, client_id, 'https://secure-client.com/callback', 'atproto', 'did:plc:fake', '', Math.floor(Date.now()/1000) + 600]
+        args: [code, client_id, 'https://secure-client.com/callback', 'atproto', 'did:plc:fake', VALID_PKCE_CHALLENGE, Math.floor(Date.now()/1000) + 600]
       });
 
       // 2. Create client_assertion
@@ -988,14 +992,24 @@ describe('ATProto OAuth Implementation Tests', () => {
         jti: 'assertion-id'
       }, privateKey, { algorithm: 'ES256', header: { kid, alg: 'ES256' } });
 
+      // DPoP is mandatory for ATProto token requests.
+      const dpopKeys = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+      const dpop = jwt.sign(
+        { htu: `${HOST}/oauth/token`, htm: 'POST', iat: Math.floor(Date.now() / 1000), jti: 'pkjwt-dpop' },
+        dpopKeys.privateKey,
+        { algorithm: 'ES256', header: { typ: 'dpop+jwt', alg: 'ES256', jwk: dpopKeys.publicKey.export({ format: 'jwk' }) } }
+      );
+
       // 3. Request token
       const res = await axios.post(`${HOST}/oauth/token`, new URLSearchParams({
         grant_type: 'authorization_code',
         code,
+        code_verifier: VALID_PKCE_VERIFIER,
         redirect_uri: 'https://secure-client.com/callback',
         client_assertion_type: 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer',
         client_assertion: assertion
       }).toString(), {
+          headers: { DPoP: dpop },
           validateStatus: s => true
       });
 

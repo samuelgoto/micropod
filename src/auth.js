@@ -210,6 +210,25 @@ export async function validateDpop(req, access_token = null) {
   return { jkt, jwk };
 }
 
+/**
+ * verifyToken() only checks the signature, and several different kinds of JWTs
+ * are signed with the same keys (legacy session tokens, OAuth access tokens,
+ * OIDC id_tokens, JARM responses and outbound service-auth tokens). Only the
+ * first two may be used to authenticate as the account owner, so make sure the
+ * payload actually looks like a user access token for this PDS's account.
+ */
+export function isUserAccessToken(payload) {
+  if (!payload || typeof payload !== 'object') return false;
+  const pdsDid = (process.env.PDS_DID || '').trim();
+  if (!pdsDid || payload.sub !== pdsDid) return false;
+  // Service-auth tokens carry a lexicon method binding; never accept them here.
+  if (payload.lxm) return false;
+  // Session / OAuth access tokens always carry a scope; id_tokens and JARM
+  // responses do not.
+  if (typeof payload.scope !== 'string' || payload.scope.trim() === '') return false;
+  return true;
+}
+
 export const auth = async (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader) {
@@ -225,10 +244,21 @@ export const auth = async (req, res, next) => {
   }
   
   if (type === 'DPoP') {
-    const { jkt } = await validateDpop(req, jwtToken);
+    let jkt;
+    try {
+      ({ jkt } = await validateDpop(req, jwtToken));
+    } catch (err) {
+      console.log(`Auth failed: DPoP validation failed for ${req.url}: ${err.message}`);
+      res.setHeader('WWW-Authenticate', `DPoP error="invalid_dpop_proof", error_description="${err.message.replace(/"/g, "'")}"`);
+      return res.status(401).json({ error: 'invalid_dpop_proof', message: err.message });
+    }
     const payload = await verifyToken(jwtToken);
     if (!payload || payload.cnf?.jkt !== jkt) {
       return res.status(401).json({ error: 'InvalidToken', message: 'DPoP binding mismatch' });
+    }
+    if (!isUserAccessToken(payload)) {
+      console.log(`Auth failed: Token is not a user access token for ${req.url}`);
+      return res.status(401).json({ error: 'InvalidToken' });
     }
     if (!req.user) req.user = {};
     req.user.auth = payload;
@@ -236,9 +266,14 @@ export const auth = async (req, res, next) => {
   }
 
   const payload = await verifyToken(jwtToken);
-  if (!payload) {
+  if (!payload || !isUserAccessToken(payload)) {
     console.log(`Auth failed: Invalid token for ${req.url}`);
     return res.status(401).json({ error: 'InvalidToken' });
+  }
+  // DPoP-bound (OAuth) access tokens must not be usable as plain bearer tokens.
+  if (payload.cnf) {
+    console.log(`Auth failed: DPoP-bound token used without DPoP for ${req.url}`);
+    return res.status(401).json({ error: 'InvalidToken', message: 'DPoP-bound token requires DPoP authorization' });
   }
   if (!req.user) req.user = {};
   req.user.auth = payload;

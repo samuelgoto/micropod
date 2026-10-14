@@ -1,6 +1,6 @@
 import express from 'express';
 import axios from 'axios';
-import { verifyToken, createServiceAuthToken } from './auth.js';
+import { createServiceAuthToken, auth, oauth } from './auth.js';
 import { isSafeUrl } from './util.js';
 
 const router = express.Router();
@@ -52,9 +52,13 @@ const resolveServiceEndpoint = async (didWithFragment) => {
 };
 
 // --- Generic XRPC Proxy Middleware (Fallthrough) ---
-router.all(/^\/xrpc\/.*/, async (req, res, next) => {
+// Only requests carrying an atproto-proxy header are proxied. Those requests are
+// signed with the account's repo key (service auth), so they MUST be
+// authenticated as the account owner first.
+const requireProxyHeader = (req, res, next) => (req.headers['atproto-proxy'] ? next() : next('route'));
+
+router.all(/^\/xrpc\/.*/, requireProxyHeader, auth, oauth('atproto'), async (req, res, next) => {
   const proxyTargetDid = req.headers['atproto-proxy'];
-  if (!proxyTargetDid) return next();
   
   const method = req.path.replace('/xrpc/', '');
   const targetUrl = await resolveServiceEndpoint(proxyTargetDid);
@@ -63,8 +67,8 @@ router.all(/^\/xrpc\/.*/, async (req, res, next) => {
     return res.status(502).json({ error: 'ProxyError', message: `Could not resolve safe endpoint for ${proxyTargetDid}` });
   }
 
-  // Identify user for Service Auth 'sub' claim
-  const userDid = (await verifyToken(req.headers.authorization?.split(' ')[1]))?.sub;
+  // Identify user for Service Auth 'sub' claim (validated by the auth middleware)
+  const userDid = req.user.auth.sub;
 
   const forwardHeaders = {};
   const whitelist = [

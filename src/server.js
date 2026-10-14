@@ -68,6 +68,11 @@ const writeLimiter = rateLimit({
   message: { error: 'RateLimitExceeded', message: 'Too many write operations. Please slow down.' }
 });
 
+// CORS must run before rate limiting so that preflights are answered without
+// counting against the limit, and so 429 responses still carry CORS headers
+// (otherwise the browser reports them as opaque CORS failures).
+app.use(cors);
+
 app.use(globalLimiter);
 
 export const wss = new WebSocketServer({ noServer: true });
@@ -81,8 +86,7 @@ wss.on('connection', (ws, req) => {
 
 // Remove broadcastRepoUpdate as it's handled by sequencer.sequenceEvent
 
-// 1. CORS middleware (Absolute top)
-app.use(cors);
+// 1. CORS middleware is registered above, before the global rate limiter.
 
 // 2. Security Headers (Helmet)
 app.use(helmet({

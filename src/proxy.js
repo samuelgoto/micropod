@@ -95,8 +95,15 @@ router.all(/^\/xrpc\/.*/, async (req, res, next) => {
       console.error(`[PROXY] Target responded with error: ${response.status} for ${req.path}`);
   }
 
-  // Forward response headers
+  // Forward response headers, but keep our own CORS headers (set by cors.js)
+  // and drop hop-by-hop / encoding headers that no longer match the body.
+  const skipHeaders = new Set([
+    'connection', 'keep-alive', 'transfer-encoding', 'content-encoding',
+    'content-length', 'vary',
+  ]);
   Object.entries(response.headers).forEach(([key, value]) => {
+    const lower = key.toLowerCase();
+    if (skipHeaders.has(lower) || lower.startsWith('access-control-')) return;
     res.setHeader(key, value);
   });
 

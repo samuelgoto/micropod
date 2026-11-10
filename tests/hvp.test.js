@@ -90,14 +90,17 @@ describe('Handle Verification issuer', () => {
     };
   }
 
-  function mockHandleAndDid({ issuer = 'https://issuer.test', handleDid = DID, backLink = `at://${HANDLE}` } = {}) {
+  function mockHandleAndDid({ issuer = 'https://issuer.test', handleDid = DID, backLink = `at://${HANDLE}`, times = 1 } = {}) {
     nock(`https://${HANDLE}`)
       .get('/.well-known/handle')
+      .times(times)
       .reply(404)
       .get('/.well-known/atproto-did')
+      .times(times)
       .reply(200, handleDid, { 'Content-Type': 'text/plain' });
     nock('https://plc.directory')
       .get(`/${encodeURIComponent(DID)}`)
+      .times(times)
       .reply(200, {
         id: DID,
         alsoKnownAs: [backLink],
@@ -184,5 +187,71 @@ describe('Handle Verification issuer', () => {
     const response = await axios.post(`${baseUrl}/hvp/issuance`, request.data, request);
     expect(response.status).toBe(400);
     expect(response.data.error).toBe('invalid_request');
+  });
+
+  test('dashboard self-check calls the issuance HTTP endpoint and verifies the full HVT+KB flow', async () => {
+    mockHandleAndDid();
+    nock('https://issuer.test')
+      .get('/.well-known/handle-verification')
+      .reply(200, {
+        issuer: 'https://issuer.test',
+        issuance_endpoint: 'https://issuer.test/hvp/issuance',
+        jwks_uri: 'https://issuer.test/hvp/jwks',
+        signing_alg_values_supported: ['Ed25519'],
+      })
+      .get('/hvp/jwks')
+      .reply(200, { keys: [getHvpPublicJwk()] })
+      .post('/hvp/issuance')
+      .reply(function (_uri, requestBody) {
+        const rawBody = typeof requestBody === 'string' ? requestBody : JSON.stringify(requestBody);
+        const body = JSON.parse(rawBody);
+        expect(this.req.headers['sec-fetch-dest']).toBe('handle-verification');
+        expect(this.req.headers.cookie).toBe(cookie);
+        expect(this.req.headers['content-type']).toMatch(/^application\/json/);
+        const keyParams = Object.fromEntries([...this.req.headers['signature-key'].matchAll(/([a-z]+)="([^"]+)"/g)].map((match) => [match[1], match[2]]));
+        const digestHeader = `sha-256=:${createHash('sha256').update(rawBody).digest('base64')}:`;
+        expect(this.req.headers['content-digest']).toBe(digestHeader);
+        const signatureParams = this.req.headers['signature-input'].replace(/^sig=/, '');
+        const signatureBase = [
+          '"@method": POST',
+          `"@authority": ${this.req.headers.host.toLowerCase()}`,
+          '"@path": /hvp/issuance',
+          `"content-digest": ${digestHeader}`,
+          `"signature-key": ${this.req.headers['signature-key']}`,
+          `"cookie": ${cookie}`,
+          `"@signature-params": ${signatureParams}`,
+        ].join('\n');
+        const holderVerifyKey = createPublicKey({ key: { kty: keyParams.kty, crv: keyParams.crv, x: keyParams.x }, format: 'jwk' });
+        const holderSignature = Buffer.from(this.req.headers.signature.match(/^sig=:([^:]+):$/)[1], 'base64');
+        expect(verify(null, Buffer.from(signatureBase), holderVerifyKey, holderSignature)).toBe(true);
+        const header = { alg: 'Ed25519', kid: getHvpPublicJwk().kid, typ: 'hvt+jwt' };
+        const payload = {
+          iss: 'https://issuer.test',
+          iat: Math.floor(Date.now() / 1000),
+          cnf: { jwk: { kty: keyParams.kty, crv: keyParams.crv, x: keyParams.x, alg: keyParams.alg } },
+          handle: body.handle,
+          sub: body.sub,
+        };
+        const signingInput = `${Buffer.from(JSON.stringify(header)).toString('base64url')}.${Buffer.from(JSON.stringify(payload)).toString('base64url')}`;
+        const signature = sign(null, Buffer.from(signingInput), getHvpPrivateKey()).toString('base64url');
+        return [200, { issuance_token: `${signingInput}.${signature}~` }];
+      });
+
+    const response = await axios.post(`${baseUrl}/admin/hvp/self-check`, {}, {
+      headers: { Cookie: cookie, Origin: 'https://issuer.test', 'Sec-Fetch-Site': 'same-origin' },
+      validateStatus: () => true,
+    });
+    expect(response.status).toBe(200);
+    expect(response.data.success).toBe(true);
+    expect(response.data.handle).toBe(HANDLE);
+    expect(response.data.steps.map((step) => step.name)).toEqual([
+      'Issuer metadata',
+      'Issuer JWKS',
+      'Holder request and issuance',
+      'HVT signature and claims',
+      'HVT+KB holder proof',
+      'Verifier handle resolution',
+    ]);
+    expect(nock.isDone()).toBe(true);
   });
 });

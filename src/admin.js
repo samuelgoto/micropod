@@ -465,7 +465,6 @@ router.get('/', requireBrowserSession, async (req, res) => {
         <p class="profile-note">Publish a <code>HandleVerification</code> service in this account's authoritative PLC DID document. The server signs the update with its <code>PLC_ROTATION_KEY</code>; the key is never sent to the browser.</p>
         <div id="plc-status" role="status">Loading PLC document status…</div>
         <form id="plc-update-form" class="danger-form" autocomplete="off">
-            <input type="password" name="password" placeholder="PDS password" required>
             <button id="plc-update-button" type="submit">Publish issuer service</button>
         </form>
         <div id="plc-result" role="status"></div>
@@ -582,7 +581,6 @@ router.get('/', requireBrowserSession, async (req, res) => {
 
         plcForm?.addEventListener('submit', async (event) => {
             event.preventDefault();
-            const password = plcForm.elements.password.value;
             if (!window.confirm('Publish the HandleVerification service for ' + ${JSON.stringify(user.did)} + ' to PLC Directory? This changes the account’s authoritative DID document.')) return;
 
             plcButton.disabled = true;
@@ -591,7 +589,7 @@ router.get('/', requireBrowserSession, async (req, res) => {
                 const response = await fetch('/admin/plc/publish', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                    body: JSON.stringify({ password })
+                    body: JSON.stringify({})
                 });
                 const data = await response.json();
                 if (!response.ok) throw new Error(data.error || 'PLC update failed');
@@ -632,10 +630,6 @@ router.get('/admin/plc/preview', requireBrowserSession, async (req, res) => {
 router.post('/admin/plc/publish', requireBrowserSession, async (req, res) => {
   if (!isSameOriginRequest(req)) {
     return res.status(403).json({ error: 'Same-origin request required.' });
-  }
-  const { password } = req.body || {};
-  if (!password || !verifyPassword(password, req.user.password)) {
-    return res.status(403).json({ error: 'Incorrect PDS password.' });
   }
   if (!req.user.did.startsWith('did:plc:')) {
     return res.status(400).json({ error: 'PLC service updates require a did:plc account.' });

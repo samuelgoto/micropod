@@ -32,44 +32,52 @@ async function dnsDids(name, key) {
 }
 
 async function wellKnownDid(handle, path, json) {
+  const url = `https://${handle}${path}`;
   let response;
   try {
-    response = await axios.get(`https://${handle}${path}`, {
+    response = await axios.get(url, {
       timeout: 5000, responseType: 'text', transformResponse: [(value) => value], validateStatus: () => true,
     });
   } catch (error) {
-    if (error.code === 'ENOTFOUND') return null;
+    if (error.code === 'ENOTFOUND') return { did: null, url, status: 'hostname not resolvable' };
     throw error;
   }
-  if (response.status === 404 || response.status === 410) return null;
+  if (response.status === 404 || response.status === 410) return { did: null, url, status: response.status };
   if (response.status < 200 || response.status >= 300) throw new Error('Handle resolution failed.');
   const contentType = String(response.headers['content-type'] || '').toLowerCase();
   if (json) {
     if (!contentType.startsWith('application/json')) throw new Error('Handle resolution returned an invalid content type.');
     let document;
     try { document = JSON.parse(response.data); } catch { throw new Error('Handle resolution returned invalid JSON.'); }
-    return typeof document.did === 'string' ? document.did : null;
+    return { did: typeof document.did === 'string' ? document.did : null, url, status: response.status, contentType };
   }
   if (!contentType.startsWith('text/plain')) throw new Error('Handle resolution returned an invalid content type.');
-  return String(response.data || '').trim() || null;
+  return { did: String(response.data || '').trim() || null, url, status: response.status, contentType };
 }
 
 async function resolveDomainHandle(handle) {
-  const dns = await dnsDids(`_handle.${handle}`, 'did');
+  const diagnostics = [];
+  const dnsName = `_handle.${handle}`;
+  const dns = await dnsDids(dnsName, 'did');
+  diagnostics.push({ source: 'DNS TXT', name: dnsName, dids: dns });
   const document = await wellKnownDid(handle, '/.well-known/handle', true);
-  const currentDids = [...new Set([...dns, ...(document ? [document] : [])])];
+  diagnostics.push({ source: 'HTTPS well-known', ...document });
+  const currentDids = [...new Set([...dns, ...(document.did ? [document.did] : [])])];
   if (currentDids.length > 1) throw new Error('Handle resolution produced conflicting DIDs.');
-  if (currentDids.length === 1) return currentDids[0];
-  const atprotoDns = await dnsDids(`_atproto.${handle}`, 'did');
+  if (currentDids.length === 1) return { did: currentDids[0], diagnostics, method: dns.length ? 'DNS TXT _handle' : 'HTTPS /.well-known/handle' };
+  const atprotoName = `_atproto.${handle}`;
+  const atprotoDns = await dnsDids(atprotoName, 'did');
+  diagnostics.push({ source: 'Legacy DNS TXT', name: atprotoName, dids: atprotoDns });
   const atprotoDocument = await wellKnownDid(handle, '/.well-known/atproto-did', false);
-  const legacyDids = [...new Set([...atprotoDns, ...(atprotoDocument ? [atprotoDocument] : [])])];
+  diagnostics.push({ source: 'Legacy HTTPS well-known', ...atprotoDocument });
+  const legacyDids = [...new Set([...atprotoDns, ...(atprotoDocument.did ? [atprotoDocument.did] : [])])];
   if (legacyDids.length !== 1) throw new Error(legacyDids.length ? 'Handle resolution produced conflicting DIDs.' : 'Handle does not resolve to a DID.');
-  return legacyDids[0];
+  return { did: legacyDids[0], diagnostics, method: atprotoDns.length ? 'legacy DNS TXT _atproto' : 'legacy HTTPS /.well-known/atproto-did' };
 }
 
 async function validateResolvedHandle(handle, sub, issuer) {
-  const did = await resolveDomainHandle(handle);
-  if (did !== sub) throw new Error('Handle resolution did not match the requested account DID.');
+  const resolution = await resolveDomainHandle(handle);
+  if (resolution.did !== sub) throw new Error('Handle resolution did not match the requested account DID.');
   if (!/^did:plc:[a-z2-7]{24}$/.test(sub)) throw new Error('Only did:plc accounts are supported by this PDS issuer.');
   const response = await axios.get(`${PLC_DIRECTORY}/${encodeURIComponent(sub)}`, { timeout: 5000 });
   if (response.data?.id !== sub) throw new Error('Resolved DID document did not match the DID.');
@@ -80,6 +88,19 @@ async function validateResolvedHandle(handle, sub, issuer) {
   if (backLink !== handle) throw new Error('DID document does not claim this handle.');
   const service = (response.data.service || []).find((item) => item.id === '#handle_verification');
   if (service?.type !== 'HandleVerification' || service.serviceEndpoint !== issuer) throw new Error('This issuer is not authorized by the account DID document.');
+  return {
+    details: [
+      ...resolution.diagnostics,
+      { source: 'PLC DID document', url: `${PLC_DIRECTORY}/${encodeURIComponent(sub)}`, status: response.status, id: response.data.id },
+      { source: 'DID back-link', expected: `at://${handle}`, found: `at://${backLink}`, matched: backLink === handle },
+      { source: 'HandleVerification service', id: service.id, type: service.type, serviceEndpoint: service.serviceEndpoint, expectedEndpoint: issuer, matched: service.serviceEndpoint === issuer },
+    ],
+    method: resolution.method,
+  };
+}
+
+function addStep(steps, name, summary, details) {
+  steps.push({ name, ok: true, summary, details });
 }
 
 async function runLiveHvpSelfCheck(req, steps) {
@@ -101,12 +122,24 @@ async function runLiveHvpSelfCheck(req, steps) {
   if (!Array.isArray(metadata.signing_alg_values_supported) || !metadata.signing_alg_values_supported.includes('Ed25519')) {
     throw new Error('Issuer metadata does not advertise Ed25519 support.');
   }
-  steps.push({ name: 'Issuer metadata', ok: true, detail: 'Issuer and HTTPS endpoint origins match.' });
+  addStep(steps, 'Issuer metadata', 'Issuer, issuance endpoint, and JWKS URL use the configured HTTPS origin; Ed25519 is advertised.', [
+    { label: 'GET', value: `${issuer}/.well-known/handle-verification` },
+    { label: 'HTTP status', value: metadataResponse.status },
+    { label: 'issuer', value: metadata.issuer, matched: metadata.issuer === issuer },
+    { label: 'issuance_endpoint', value: issuanceUrl.href, sameOrigin: issuanceUrl.origin === issuer },
+    { label: 'jwks_uri', value: jwksUrl.href, sameOrigin: jwksUrl.origin === issuer },
+    { label: 'signing_alg_values_supported', value: metadata.signing_alg_values_supported },
+    { label: 'federations', value: metadata.federations || [] },
+  ]);
 
   const jwksResponse = await http.get(jwksUrl.href);
   const keys = jwksResponse.data?.keys;
   if (!Array.isArray(keys) || !keys.length) throw new Error('Issuer JWKS did not contain any signing keys.');
-  steps.push({ name: 'Issuer JWKS', ok: true, detail: `${keys.length} public signing key(s) published.` });
+  addStep(steps, 'Issuer JWKS', 'The issuer publishes at least one public signing key.', [
+    { label: 'GET', value: jwksUrl.href },
+    { label: 'HTTP status', value: jwksResponse.status },
+    { label: 'keys', value: keys.map(({ kid, kty, crv, alg, use }) => ({ kid, kty, crv, alg, use })) },
+  ]);
 
   const { privateKey: holderPrivateKey, publicKey: holderPublicKey } = generateKeyPairSync('ed25519');
   const exportedHolderKey = holderPublicKey.export({ format: 'jwk' });
@@ -129,6 +162,9 @@ async function runLiveHvpSelfCheck(req, steps) {
     `"@signature-params": ${signatureInput.slice(4)}`,
   ].join('\n');
   const holderSignature = cryptoSign(null, Buffer.from(signatureBase), holderPrivateKey).toString('base64');
+  const signatureHeader = `sig=:${holderSignature}:`;
+  const holderRequestSignatureValid = cryptoVerify(null, Buffer.from(signatureBase), holderPublicKey, Buffer.from(holderSignature, 'base64'));
+  if (!holderRequestSignatureValid) throw new Error('The generated holder request signature did not verify.');
 
   const issuanceHeaders = {
     host: issuanceUrl.host,
@@ -137,7 +173,7 @@ async function runLiveHvpSelfCheck(req, steps) {
     'sec-fetch-site': 'same-origin',
     'content-digest': digest,
     'signature-input': signatureInput,
-    signature: `sig=:${holderSignature}:`,
+    signature: signatureHeader,
     'signature-key': signatureKey,
     cookie: cookieHeader,
   };
@@ -152,7 +188,23 @@ async function runLiveHvpSelfCheck(req, steps) {
   if (typeof issuanceToken !== 'string' || !issuanceToken.endsWith('~')) {
     throw new Error('The issuance endpoint did not return an HVT in the expected SD-JWT format.');
   }
-  steps.push({ name: 'Holder request and issuance', ok: true, detail: 'The live endpoint accepted the signed holder request and session cookie.' });
+  addStep(steps, 'Holder request and issuance', 'The issuer accepted the holder request and authenticated session.', [
+    { label: 'request', value: `POST ${issuanceUrl.href}` },
+    { label: 'content-type', value: issuanceHeaders['content-type'] },
+    { label: 'Sec-Fetch-Dest', value: issuanceHeaders['sec-fetch-dest'] },
+    { label: 'session cookie', value: 'present (value redacted)' },
+    { label: 'request body', value: JSON.parse(body) },
+    { label: 'Content-Digest', value: digest },
+    { label: 'Signature-Input', value: signatureInput },
+    { label: 'Signature-Key', value: signatureKey },
+    { label: 'Signature', value: signatureHeader },
+    { label: 'signature base (cookie redacted)', value: signatureBase.replace(`"cookie": ${cookieHeader}`, '"cookie": [redacted]') },
+    { label: 'signed components', value: ['@method', '@authority', '@path', 'content-digest', 'signature-key', 'cookie'] },
+    { label: 'local holder signature check', value: holderRequestSignatureValid ? 'PASS' : 'FAIL' },
+    { label: 'HTTP response status', value: issuanceResponse.status },
+    { label: 'issuance token format', value: 'SD-JWT with trailing ~' },
+    { label: 'HVT', value: issuanceToken },
+  ]);
 
   const hvtParts = issuanceToken.slice(0, -1).split('.');
   if (hvtParts.length !== 3) throw new Error('The issuer returned a malformed HVT.');
@@ -179,7 +231,19 @@ async function runLiveHvpSelfCheck(req, steps) {
   if (!hvtPayload.cnf?.jwk || ['kty', 'crv', 'x', 'alg'].some((name) => hvtPayload.cnf.jwk[name] !== holderJwk[name])) {
     throw new Error('HVT confirmation key does not match the simulated holder key.');
   }
-  steps.push({ name: 'HVT signature and claims', ok: true, detail: 'Issuer signature, handle, DID, issue time, and holder key verified.' });
+  addStep(steps, 'HVT signature and claims', 'The HVT signature verifies against the advertised issuer key, and its claims match this account and the simulated holder key.', [
+    { label: 'HVT header', value: hvtHeader },
+    { label: 'HVT claims', value: hvtPayload },
+    { label: 'JWKS key selected', value: { kid: signingKey.kid, kty: signingKey.kty, crv: signingKey.crv, alg: signingKey.alg } },
+    { label: 'issuer signature', value: 'PASS (Ed25519)' },
+    { label: 'iss matches configured issuer', value: hvtPayload.iss === issuer },
+    { label: 'handle matches account', value: hvtPayload.handle === handle },
+    { label: 'sub matches account DID', value: hvtPayload.sub === did },
+    { label: 'iat within 300 seconds', value: true },
+    { label: 'cnf.jwk matches generated holder key', value: true },
+    { label: 'simulated holder public JWK', value: holderJwk },
+    { label: 'HVT', value: issuanceToken },
+  ]);
 
   const verifierOrigin = 'https://hvp-self-check.invalid';
   const nonce = randomBytes(16).toString('base64url');
@@ -203,13 +267,30 @@ async function runLiveHvpSelfCheck(req, steps) {
   };
   const holderVerifyKey = createPublicKey({ key: { kty: holderJwk.kty, crv: holderJwk.crv, x: holderJwk.x }, format: 'jwk' });
   const expectedSdHash = createHash('sha256').update(`${presentedHvt}~`).digest('base64url');
-  if (kb.header.alg !== hvtPayload.cnf.jwk.alg || kb.header.typ !== 'kb+jwt' || kb.payload.aud !== verifierOrigin || kb.payload.nonce !== nonce || kb.payload.sd_hash !== expectedSdHash || Math.abs(Date.now() / 1000 - kb.payload.iat) > 300 || !cryptoVerify(null, kb.signingInput, holderVerifyKey, kb.signature)) {
+  const kbChecks = {
+    algorithmMatchesConfirmationKey: kb.header.alg === hvtPayload.cnf.jwk.alg,
+    typeIsKeyBindingJwt: kb.header.typ === 'kb+jwt',
+    audienceMatchesVerifier: kb.payload.aud === verifierOrigin,
+    nonceMatches: kb.payload.nonce === nonce,
+    sdHashMatchesHvt: kb.payload.sd_hash === expectedSdHash,
+    issueTimeWithin300Seconds: Math.abs(Date.now() / 1000 - kb.payload.iat) <= 300,
+    holderSignatureValid: cryptoVerify(null, kb.signingInput, holderVerifyKey, kb.signature),
+  };
+  if (Object.values(kbChecks).some((passed) => !passed)) {
     throw new Error('Simulated verifier rejected the holder key-binding JWT.');
   }
-  steps.push({ name: 'HVT+KB holder proof', ok: true, detail: 'Verifier audience, nonce, HVT hash, and holder signature verified.' });
+  const hvtKbToken = `${issuanceToken}${kbInput}.${kbSignature}`;
+  addStep(steps, 'HVT+KB holder proof', 'The simulated verifier accepts the key-binding JWT for this HVT.', [
+    { label: 'KB-JWT header', value: kb.header },
+    { label: 'KB-JWT claims', value: kb.payload },
+    { label: 'verification checks', value: kbChecks },
+    { label: 'sd_hash expected', value: expectedSdHash },
+    { label: 'sd_hash actual', value: kb.payload.sd_hash },
+    { label: 'HVT+KB', value: hvtKbToken },
+  ]);
 
-  await validateResolvedHandle(handle, did, issuer);
-  steps.push({ name: 'Verifier handle resolution', ok: true, detail: 'Live handle resolution, DID back-link, and authorized issuer service agree.' });
+  const resolution = await validateResolvedHandle(handle, did, issuer);
+  addStep(steps, 'Verifier handle resolution', `The handle resolves to the account DID through ${resolution.method}; the DID back-link and issuer service match.`, resolution.details.map((entry) => ({ label: entry.source, value: entry })));
 }
 
 export async function runHvpSelfCheck(req) {
@@ -222,4 +303,58 @@ export async function runHvpSelfCheck(req) {
     error.steps = steps;
     throw error;
   }
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (character) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  })[character]);
+}
+
+function formatDetail(value) {
+  if (typeof value === 'string') return value;
+  return JSON.stringify(value, null, 2);
+}
+
+export function renderHvpSelfCheckHtml({ success, handle, did, issuer, steps = [], error = '' }) {
+  const resultMarkup = steps.map((step) => `
+    <section class="step ${step.ok ? 'pass' : 'fail'}">
+      <h2><span>${step.ok ? 'PASS' : 'FAIL'}</span> ${escapeHtml(step.name)}</h2>
+      <p>${escapeHtml(step.summary || step.detail || '')}</p>
+      ${step.details?.length ? `<dl>${step.details.map(({ label, value }) => `
+        <dt>${escapeHtml(label)}</dt><dd><pre>${escapeHtml(formatDetail(value))}</pre></dd>
+      `).join('')}</dl>` : ''}
+    </section>`).join('');
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Handle Verification Self-Check</title>
+  <style>
+    :root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; }
+    body { max-width: 960px; margin: 2rem auto; padding: 0 1rem 3rem; }
+    h1 { margin-bottom: .25rem; }
+    .identity, .summary { color: #777; overflow-wrap: anywhere; }
+    .step { margin: 1rem 0; padding: 1rem 1.25rem; border: 1px solid #7776; border-radius: .75rem; }
+    .step h2 { margin: 0; font-size: 1.15rem; }
+    .pass h2 span { color: #17803d; } .fail h2 span, .error { color: #c33; }
+    dl { display: grid; grid-template-columns: minmax(150px, 220px) minmax(0, 1fr); gap: .5rem 1rem; }
+    dt { font-weight: 650; } dd { margin: 0; min-width: 0; }
+    pre { margin: 0; padding: .65rem; white-space: pre-wrap; overflow-wrap: anywhere; background: #7771; border-radius: .35rem; }
+    .actions { margin-top: 2rem; }
+    a { color: inherit; }
+    @media (max-width: 600px) { dl { grid-template-columns: 1fr; gap: .15rem; } dd { margin-bottom: .65rem; } }
+  </style>
+</head>
+<body>
+  <h1>Handle Verification Self-Check</h1>
+  <p class="identity">Handle: <strong>${escapeHtml(handle || 'unknown')}</strong><br>DID: <code>${escapeHtml(did || 'unknown')}</code><br>Issuer: <code>${escapeHtml(issuer || 'unknown')}</code></p>
+  <h2 class="${success ? 'pass' : 'error'}">${success ? 'All checks passed' : 'Self-check failed'}</h2>
+  ${error ? `<p class="error">${escapeHtml(error)}</p>` : ''}
+  ${resultMarkup || '<p>No verification steps completed.</p>'}
+  <p class="summary">The report includes the simulated HVT and HVT+KB tokens. It redacts the session cookie and never includes the holder private key.</p>
+  <div class="actions"><a href="/">Return to admin dashboard</a></div>
+</body>
+</html>`;
 }

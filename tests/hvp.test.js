@@ -237,21 +237,24 @@ describe('Handle Verification issuer', () => {
         return [200, { issuance_token: `${signingInput}.${signature}~` }];
       });
 
-    const response = await axios.post(`${baseUrl}/admin/hvp/self-check`, {}, {
-      headers: { Cookie: cookie, Origin: 'https://issuer.test', 'Sec-Fetch-Site': 'same-origin' },
+    const response = await axios.get(`${baseUrl}/admin/hvp/self-check`, {
+      headers: { Cookie: cookie },
       validateStatus: () => true,
     });
     expect(response.status).toBe(200);
-    expect(response.data.success).toBe(true);
-    expect(response.data.handle).toBe(HANDLE);
-    expect(response.data.steps.map((step) => step.name)).toEqual([
-      'Issuer metadata',
-      'Issuer JWKS',
-      'Holder request and issuance',
-      'HVT signature and claims',
-      'HVT+KB holder proof',
-      'Verifier handle resolution',
-    ]);
+    expect(response.headers['content-type']).toMatch(/^text\/html/);
+    expect(response.headers['cache-control']).toBe('no-store');
+    expect(response.data).toContain('All checks passed');
+    expect(response.data).toContain('Issuer metadata');
+    expect(response.data).toContain('Issuer JWKS');
+    expect(response.data).toContain('Holder request and issuance');
+    expect(response.data).toContain('HVT signature and claims');
+    expect(response.data).toContain('HVT+KB holder proof');
+    expect(response.data).toContain('Verifier handle resolution');
+    expect(response.data).toContain('HVT</dt>');
+    expect(response.data).toContain('HVT+KB</dt>');
+    expect(response.data).toContain('Signature-Input');
+    expect(response.data).toContain('value redacted');
     expect(nock.isDone()).toBe(true);
   });
 });

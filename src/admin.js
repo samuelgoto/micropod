@@ -8,7 +8,7 @@ import { setUpRepo, getRootCid, acquireRepoWriteLock } from './repo.js';
 import { escapeHtml, verifyPassword } from './util.js';
 import { getLoginUrl } from './session.js';
 import { buildFedCmAccount, getConfigUrl } from './fedcm.js';
-import { runHvpSelfCheck } from './hvp-selfcheck.js';
+import { renderHvpSelfCheckHtml, runHvpSelfCheck } from './hvp-selfcheck.js';
 
 const router = express.Router();
 
@@ -477,11 +477,8 @@ router.get('/', requireBrowserSession, async (req, res) => {
 
     <div class="card">
         <h2>Handle Verification Self-Check</h2>
-        <p class="profile-note">Simulate a holder and verifier for <code>${escapeHtml(user.handle)}</code>. The check reads the live issuer metadata and JWKS, sends a signed holder request with your current session to the published issuance endpoint, then verifies the HVT, key binding, and public handle authorization. It does not publish or change anything.</p>
-        <div class="actions">
-            <button id="hvp-self-check-button" type="button">Run HVP Self-Check</button>
-        </div>
-        <div id="hvp-self-check-result" role="status" aria-live="polite">Idle</div>
+        <p class="profile-note">Simulate a holder and verifier for <code>${escapeHtml(user.handle)}</code>. The report shows the live issuer metadata and JWKS, signed issuance request, HVT and HVT+KB claims and tokens, and handle resolution checks. It does not publish or change anything.</p>
+        <a class="button-primary" href="/admin/hvp/self-check">Run HVP Self-Check</a>
     </div>
 
     <div class="card danger-zone">
@@ -628,27 +625,6 @@ router.get('/', requireBrowserSession, async (req, res) => {
 
         refreshPlcStatus();
 
-        const hvpCheckButton = document.getElementById('hvp-self-check-button');
-        const hvpCheckResult = document.getElementById('hvp-self-check-result');
-        hvpCheckButton?.addEventListener('click', async () => {
-            hvpCheckButton.disabled = true;
-            hvpCheckResult.textContent = 'Checking live issuer metadata, signing, holder binding, and handle resolution…';
-            try {
-                const response = await fetch('/admin/hvp/self-check', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                    body: '{}'
-                });
-                const data = await response.json();
-                const lines = (data.steps || []).map(step => (step.ok ? 'PASS' : 'FAIL') + ' — ' + step.name + ': ' + step.detail);
-                if (!response.ok || !data.success) lines.push('FAIL — ' + (data.error || 'Self-check failed.'));
-                hvpCheckResult.textContent = lines.join('\\n') || 'Self-check returned no results.';
-            } catch (error) {
-                hvpCheckResult.textContent = 'FAIL — ' + error.message;
-            } finally {
-                hvpCheckButton.disabled = false;
-            }
-        });
     </script>
 </body>
 </html>
@@ -703,16 +679,21 @@ router.post('/admin/plc/publish', requireBrowserSession, async (req, res) => {
   }
 });
 
-router.post('/admin/hvp/self-check', requireBrowserSession, async (req, res) => {
-  if (!isSameOriginRequest(req)) {
-    return res.status(403).json({ error: 'Same-origin request required.', steps: [] });
-  }
+router.get('/admin/hvp/self-check', requireBrowserSession, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
   try {
     const result = await runHvpSelfCheck(req);
-    return res.json({ success: true, ...result });
+    return res.status(200).type('html').send(renderHvpSelfCheckHtml({ success: true, ...result }));
   } catch (error) {
     console.error('[HVP_SELF_CHECK] Failed:', error.message);
-    return res.status(502).json({ success: false, error: error.message || 'HVP self-check failed.', steps: error.steps || [] });
+    return res.status(502).type('html').send(renderHvpSelfCheckHtml({
+      success: false,
+      handle: String(req.user.handle).toLowerCase(),
+      did: req.user.did,
+      issuer: getIssuerOrigin(req),
+      error: error.message || 'HVP self-check failed.',
+      steps: error.steps || [],
+    }));
   }
 });
 

@@ -40,6 +40,7 @@ async function getPlcUpdatePreview(did, issuerOrigin) {
     previousCid: latest.cid,
     currentEndpoint: existing?.endpoint || null,
     alreadyConfigured: existing?.type === 'HandleVerification' && existing?.endpoint === issuerOrigin,
+    hasHandleVerificationService: existing?.type === 'HandleVerification',
     rotationKeys: latest.operation.rotationKeys || [],
   };
 }
@@ -50,7 +51,7 @@ function isSameOriginRequest(req) {
   return req.get('sec-fetch-site') === 'same-origin';
 }
 
-async function publishHandleVerificationService(did, issuerOrigin) {
+async function updateHandleVerificationService(did, issuerOrigin, action) {
   const rotationKeyHex = (process.env.PLC_ROTATION_KEY || '').trim();
   if (!/^[0-9a-f]{64}$/i.test(rotationKeyHex)) {
     throw new Error('PLC_ROTATION_KEY is missing or is not a 32-byte hex private key.');
@@ -65,8 +66,11 @@ async function publishHandleVerificationService(did, issuerOrigin) {
     throw new Error('Could not identify the latest active PLC operation.');
   }
   const existingService = latest.operation.services?.handle_verification;
-  if (existingService?.type === 'HandleVerification' && existingService?.endpoint === issuerOrigin) {
+  if (action === 'set' && existingService?.type === 'HandleVerification' && existingService?.endpoint === issuerOrigin) {
     throw new Error('The PLC document already publishes this HandleVerification service.');
+  }
+  if (action === 'remove' && existingService?.type !== 'HandleVerification') {
+    throw new Error('There is no HandleVerification service to remove.');
   }
 
   const keypair = await atpCrypto.Secp256k1Keypair.import(new Uint8Array(Buffer.from(rotationKeyHex, 'hex')));
@@ -75,18 +79,18 @@ async function publishHandleVerificationService(did, issuerOrigin) {
     throw new Error('PLC_ROTATION_KEY does not match a rotation key authorized by the latest PLC operation.');
   }
 
+  const services = { ...latest.operation.services };
+  if (action === 'remove') {
+    delete services.handle_verification;
+  } else {
+    services.handle_verification = { type: 'HandleVerification', endpoint: issuerOrigin };
+  }
   const operation = {
     type: 'plc_operation',
     rotationKeys: latest.operation.rotationKeys,
     verificationMethods: latest.operation.verificationMethods,
     alsoKnownAs: latest.operation.alsoKnownAs,
-    services: {
-      ...latest.operation.services,
-      handle_verification: {
-        type: 'HandleVerification',
-        endpoint: issuerOrigin,
-      },
-    },
+    services,
     prev: latest.cid,
   };
   const signature = await keypair.sign(cbor.encode(operation));
@@ -96,7 +100,7 @@ async function publishHandleVerificationService(did, issuerOrigin) {
     timeout: 15000,
     headers: { 'Content-Type': 'application/json' },
   });
-  return { did, issuerOrigin, previousCid: latest.cid };
+  return { did, issuerOrigin, previousCid: latest.cid, action };
 }
 
 function requireBrowserSession(req, res, next) {
@@ -572,7 +576,12 @@ router.get('/', requireBrowserSession, async (req, res) => {
                 plcStatus.textContent = data.alreadyConfigured
                     ? 'The PLC document already authorizes ' + data.issuerOrigin + '.'
                     : 'Current HandleVerification endpoint: ' + (data.currentEndpoint || 'not set') + '. Proposed endpoint: ' + data.issuerOrigin + '.';
-                plcForm.hidden = data.alreadyConfigured;
+                plcForm.hidden = false;
+                plcButton.dataset.action = data.hasHandleVerificationService ? 'remove' : 'set';
+                plcButton.textContent = data.hasHandleVerificationService
+                    ? (data.alreadyConfigured ? 'Remove issuer service' : 'Replace issuer service')
+                    : 'Publish issuer service';
+                plcButton.classList.toggle('danger', data.hasHandleVerificationService);
             } catch (error) {
                 plcStatus.textContent = error.message;
                 plcForm.hidden = true;
@@ -581,7 +590,11 @@ router.get('/', requireBrowserSession, async (req, res) => {
 
         plcForm?.addEventListener('submit', async (event) => {
             event.preventDefault();
-            if (!window.confirm('Publish the HandleVerification service for ' + ${JSON.stringify(user.did)} + ' to PLC Directory? This changes the account’s authoritative DID document.')) return;
+            const action = plcButton.dataset.action || 'set';
+            const confirmText = action === 'remove'
+                ? 'Remove the HandleVerification service for ' + ${JSON.stringify(user.did)} + ' from PLC Directory? Verification through this issuer will stop working.'
+                : 'Publish the HandleVerification service for ' + ${JSON.stringify(user.did)} + ' to PLC Directory? This changes the account’s authoritative DID document.';
+            if (!window.confirm(confirmText)) return;
 
             plcButton.disabled = true;
             plcResult.textContent = 'Signing and submitting the PLC update…';
@@ -589,11 +602,11 @@ router.get('/', requireBrowserSession, async (req, res) => {
                 const response = await fetch('/admin/plc/publish', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                    body: JSON.stringify({})
+                    body: JSON.stringify({ action })
                 });
                 const data = await response.json();
                 if (!response.ok) throw new Error(data.error || 'PLC update failed');
-                plcResult.textContent = 'Published. PLC Directory accepted the update for ' + data.did + '. Refreshing status…';
+                plcResult.textContent = 'PLC Directory accepted the ' + (action === 'remove' ? 'removal' : 'update') + ' for ' + data.did + '. Refreshing status…';
                 plcForm.reset();
                 await refreshPlcStatus();
             } catch (error) {
@@ -621,7 +634,13 @@ router.get('/admin/plc/preview', requireBrowserSession, async (req, res) => {
   }
   try {
     const preview = await getPlcUpdatePreview(req.user.did, issuerOrigin);
-    return res.json({ ...preview, rotationKeys: undefined });
+    return res.json({
+      did: preview.did,
+      issuerOrigin: preview.issuerOrigin,
+      currentEndpoint: preview.currentEndpoint,
+      alreadyConfigured: preview.alreadyConfigured,
+      hasHandleVerificationService: preview.hasHandleVerificationService,
+    });
   } catch (error) {
     return res.status(502).json({ error: error.message || 'Could not read PLC Directory.' });
   }
@@ -638,8 +657,12 @@ router.post('/admin/plc/publish', requireBrowserSession, async (req, res) => {
   if (!issuerOrigin || !issuerOrigin.startsWith('https://')) {
     return res.status(400).json({ error: 'A canonical HTTPS issuer origin is required for PLC updates.' });
   }
+  const { action } = req.body || {};
+  if (!['set', 'remove'].includes(action)) {
+    return res.status(400).json({ error: 'Action must be set or remove.' });
+  }
   try {
-    const result = await publishHandleVerificationService(req.user.did, issuerOrigin);
+    const result = await updateHandleVerificationService(req.user.did, issuerOrigin, action);
     return res.json({ success: true, ...result });
   } catch (error) {
     const upstream = error.response?.data;

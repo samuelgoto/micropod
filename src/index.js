@@ -21,7 +21,7 @@ function normalizeHostname(value) {
 }
 
 async function resolveRelayHostname() {
-  const explicitHost = normalizeHostname(process.env.PDS_HOST || process.env.DOMAIN);
+  const explicitHost = normalizeHostname(process.env.DOMAIN);
   if (explicitHost) {
     return explicitHost;
   }

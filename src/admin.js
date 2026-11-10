@@ -1,6 +1,8 @@
 import express from 'express';
+import axios from 'axios';
 import { db, destroy } from './db.js';
 import * as cbor from '@ipld/dag-cbor';
+import * as atpCrypto from '@atproto/crypto';
 import { sequencer } from './sequencer.js';
 import { setUpRepo, getRootCid, acquireRepoWriteLock } from './repo.js';
 import { escapeHtml, verifyPassword } from './util.js';
@@ -8,6 +10,94 @@ import { getLoginUrl } from './session.js';
 import { buildFedCmAccount, getConfigUrl } from './fedcm.js';
 
 const router = express.Router();
+
+const PLC_DIRECTORY = 'https://plc.directory';
+
+function getIssuerOrigin(req) {
+  try {
+    const configured = process.env.DOMAIN;
+    if (!configured) return '';
+    const candidate = configured.includes('://') ? configured : `https://${configured}`;
+    return new URL(candidate).origin;
+  } catch {
+    return '';
+  }
+}
+
+async function getPlcUpdatePreview(did, issuerOrigin) {
+  const response = await axios.get(`${PLC_DIRECTORY}/${encodeURIComponent(did)}/log/audit`, { timeout: 10000 });
+  if (!Array.isArray(response.data) || response.data.length === 0) {
+    throw new Error('PLC Directory returned no operation history for this DID.');
+  }
+  const latest = [...response.data].reverse().find((entry) => !entry.nullified);
+  if (!latest?.operation || !latest.cid || latest.did !== did) {
+    throw new Error('Could not identify the latest active PLC operation.');
+  }
+  const existing = latest.operation.services?.handle_verification;
+  return {
+    did,
+    issuerOrigin,
+    previousCid: latest.cid,
+    currentEndpoint: existing?.endpoint || null,
+    alreadyConfigured: existing?.type === 'HandleVerification' && existing?.endpoint === issuerOrigin,
+    rotationKeys: latest.operation.rotationKeys || [],
+  };
+}
+
+function isSameOriginRequest(req) {
+  const origin = req.get('origin');
+  if (!origin || origin !== getIssuerOrigin(req)) return false;
+  return req.get('sec-fetch-site') === 'same-origin';
+}
+
+async function publishHandleVerificationService(did, issuerOrigin) {
+  const rotationKeyHex = (process.env.PLC_ROTATION_KEY || '').trim();
+  if (!/^[0-9a-f]{64}$/i.test(rotationKeyHex)) {
+    throw new Error('PLC_ROTATION_KEY is missing or is not a 32-byte hex private key.');
+  }
+
+  const response = await axios.get(`${PLC_DIRECTORY}/${encodeURIComponent(did)}/log/audit`, { timeout: 10000 });
+  if (!Array.isArray(response.data) || response.data.length === 0) {
+    throw new Error('PLC Directory returned no operation history for this DID.');
+  }
+  const latest = [...response.data].reverse().find((entry) => !entry.nullified);
+  if (!latest?.operation || !latest.cid || latest.did !== did) {
+    throw new Error('Could not identify the latest active PLC operation.');
+  }
+  const existingService = latest.operation.services?.handle_verification;
+  if (existingService?.type === 'HandleVerification' && existingService?.endpoint === issuerOrigin) {
+    throw new Error('The PLC document already publishes this HandleVerification service.');
+  }
+
+  const keypair = await atpCrypto.Secp256k1Keypair.import(new Uint8Array(Buffer.from(rotationKeyHex, 'hex')));
+  const authorizedKey = keypair.did();
+  if (!(latest.operation.rotationKeys || []).includes(authorizedKey)) {
+    throw new Error('PLC_ROTATION_KEY does not match a rotation key authorized by the latest PLC operation.');
+  }
+
+  const operation = {
+    type: 'plc_operation',
+    rotationKeys: latest.operation.rotationKeys,
+    verificationMethods: latest.operation.verificationMethods,
+    alsoKnownAs: latest.operation.alsoKnownAs,
+    services: {
+      ...latest.operation.services,
+      handle_verification: {
+        type: 'HandleVerification',
+        endpoint: issuerOrigin,
+      },
+    },
+    prev: latest.cid,
+  };
+  const signature = await keypair.sign(cbor.encode(operation));
+  const signedOperation = { ...operation, sig: Buffer.from(signature).toString('base64url') };
+
+  await axios.post(`${PLC_DIRECTORY}/${encodeURIComponent(did)}`, signedOperation, {
+    timeout: 15000,
+    headers: { 'Content-Type': 'application/json' },
+  });
+  return { did, issuerOrigin, previousCid: latest.cid };
+}
 
 function requireBrowserSession(req, res, next) {
   if (req.session) {
@@ -370,6 +460,17 @@ router.get('/', requireBrowserSession, async (req, res) => {
         <div id="fedcm-status">Idle</div>
     </div>
 
+    <div class="card">
+        <h2>PLC Handle Verification Issuer</h2>
+        <p class="profile-note">Publish a <code>HandleVerification</code> service in this account's authoritative PLC DID document. The server signs the update with its <code>PLC_ROTATION_KEY</code>; the key is never sent to the browser.</p>
+        <div id="plc-status" role="status">Loading PLC document status…</div>
+        <form id="plc-update-form" class="danger-form" autocomplete="off">
+            <input type="password" name="password" placeholder="PDS password" required>
+            <button id="plc-update-button" type="submit">Publish issuer service</button>
+        </form>
+        <div id="plc-result" role="status"></div>
+    </div>
+
     <div class="card danger-zone">
         <h2>Danger Zone</h2>
         <p>Wiping the PDS will delete all posts, follows, likes, and profile data. This cannot be undone.</p>
@@ -458,12 +559,101 @@ router.get('/', requireBrowserSession, async (req, res) => {
                 status.textContent = 'IdentityProvider.unregister failed: ' + err.message;
             }
         });
+
+        const plcStatus = document.getElementById('plc-status');
+        const plcResult = document.getElementById('plc-result');
+        const plcForm = document.getElementById('plc-update-form');
+        const plcButton = document.getElementById('plc-update-button');
+
+        async function refreshPlcStatus() {
+            try {
+                const response = await fetch('/admin/plc/preview', { headers: { 'Accept': 'application/json' } });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || 'Could not read PLC status');
+                plcStatus.textContent = data.alreadyConfigured
+                    ? 'The PLC document already authorizes ' + data.issuerOrigin + '.'
+                    : 'Current HandleVerification endpoint: ' + (data.currentEndpoint || 'not set') + '. Proposed endpoint: ' + data.issuerOrigin + '.';
+                plcForm.hidden = data.alreadyConfigured;
+            } catch (error) {
+                plcStatus.textContent = error.message;
+                plcForm.hidden = true;
+            }
+        }
+
+        plcForm?.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            const password = plcForm.elements.password.value;
+            if (!window.confirm('Publish the HandleVerification service for ' + ${JSON.stringify(user.did)} + ' to PLC Directory? This changes the account’s authoritative DID document.')) return;
+
+            plcButton.disabled = true;
+            plcResult.textContent = 'Signing and submitting the PLC update…';
+            try {
+                const response = await fetch('/admin/plc/publish', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                    body: JSON.stringify({ password })
+                });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.error || 'PLC update failed');
+                plcResult.textContent = 'Published. PLC Directory accepted the update for ' + data.did + '. Refreshing status…';
+                plcForm.reset();
+                await refreshPlcStatus();
+            } catch (error) {
+                plcResult.textContent = error.message;
+            } finally {
+                plcButton.disabled = false;
+            }
+        });
+
+        refreshPlcStatus();
     </script>
 </body>
 </html>
   `;
   res.send(html);
 });
+
+router.get('/admin/plc/preview', requireBrowserSession, async (req, res) => {
+  if (!req.user.did.startsWith('did:plc:')) {
+    return res.status(400).json({ error: 'PLC service updates require a did:plc account.' });
+  }
+  const issuerOrigin = getIssuerOrigin(req);
+  if (!issuerOrigin || !issuerOrigin.startsWith('https://')) {
+    return res.status(400).json({ error: 'A canonical HTTPS issuer origin is required for PLC updates.' });
+  }
+  try {
+    const preview = await getPlcUpdatePreview(req.user.did, issuerOrigin);
+    return res.json({ ...preview, rotationKeys: undefined });
+  } catch (error) {
+    return res.status(502).json({ error: error.message || 'Could not read PLC Directory.' });
+  }
+});
+
+router.post('/admin/plc/publish', requireBrowserSession, async (req, res) => {
+  if (!isSameOriginRequest(req)) {
+    return res.status(403).json({ error: 'Same-origin request required.' });
+  }
+  const { password } = req.body || {};
+  if (!password || !verifyPassword(password, req.user.password)) {
+    return res.status(403).json({ error: 'Incorrect PDS password.' });
+  }
+  if (!req.user.did.startsWith('did:plc:')) {
+    return res.status(400).json({ error: 'PLC service updates require a did:plc account.' });
+  }
+  const issuerOrigin = getIssuerOrigin(req);
+  if (!issuerOrigin || !issuerOrigin.startsWith('https://')) {
+    return res.status(400).json({ error: 'A canonical HTTPS issuer origin is required for PLC updates.' });
+  }
+  try {
+    const result = await publishHandleVerificationService(req.user.did, issuerOrigin);
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    const upstream = error.response?.data;
+    const detail = typeof upstream === 'string' ? upstream : upstream?.message || upstream?.error;
+    return res.status(502).json({ error: detail || error.message || 'PLC update failed.' });
+  }
+});
+
 router.post('/debug/reset', requireBrowserSession, async (req, res) => {
   const { password } = req.body;
   const user = req.user;

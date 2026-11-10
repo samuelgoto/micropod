@@ -129,9 +129,17 @@ async function dnsDids(name, key) {
 }
 
 async function wellKnownDid(handle, path, json) {
-  const response = await axios.get(`https://${handle}${path}`, {
-    timeout: 5000, responseType: 'text', transformResponse: [(value) => value], validateStatus: () => true,
-  });
+  let response;
+  try {
+    response = await axios.get(`https://${handle}${path}`, {
+      timeout: 5000, responseType: 'text', transformResponse: [(value) => value], validateStatus: () => true,
+    });
+  } catch (error) {
+    // A handle may publish a DNS TXT DID while its hostname has no address
+    // record. Treat that HTTPS method as unavailable and continue resolution.
+    if (error.code === 'ENOTFOUND') return null;
+    throw error;
+  }
   if (response.status === 404 || response.status === 410) return null;
   if (response.status < 200 || response.status >= 300) throw new Error('Handle resolution failed.');
   const contentType = String(response.headers['content-type'] || '').toLowerCase();

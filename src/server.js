@@ -15,6 +15,7 @@ import { rateLimit } from 'express-rate-limit';
 import { TID } from '@atproto/common';
 import * as cbor from '@ipld/dag-cbor';
 import oauthRouter from './oauth.js';
+import hvpRouter from './hvp.js';
 import admin from './admin.js';
 import proxy from './proxy.js';
 import cors from './cors.js';
@@ -114,7 +115,7 @@ app.use(helmet({
 }));
 
 // 3. JSON parser
-app.use(express.json());
+app.use(express.json({ verify: (req, _res, buffer) => { req.rawBody = Buffer.from(buffer); } }));
 app.use(express.urlencoded({ extended: true }));
 
 // --- PDS User Context Middleware ---
@@ -153,6 +154,7 @@ app.use(async (req, res, next) => {
 });
 
 app.use(attachSession);
+app.use(hvpRouter);
 app.use(oauthRouter);
 app.use(loginRouter);
 app.use(fedcmRouter);
@@ -955,6 +957,13 @@ app.use((req, res, next) => {
 app.use((err, req, res, next) => {
   if (res.headersSent) {
     return next(err);
+  }
+
+  if (req.path === '/hvp/issuance' && (err.type === 'entity.parse.failed' || err.type === 'entity.too.large')) {
+    return res.status(err.status || 400).json({
+      error: 'invalid_request',
+      error_description: 'Invalid or malformed request body.',
+    });
   }
 
   console.error('[GLOBAL_ERROR]', err.stack || err);

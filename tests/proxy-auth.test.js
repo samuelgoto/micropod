@@ -15,8 +15,7 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const PORT = 3012;
-const PDS_URL = `http://localhost:${PORT}`;
+let PDS_URL;
 const APPVIEW_DID = 'did:web:appview.test';
 const APPVIEW_URL = 'https://appview.test';
 const PROXY_HEADER = `${APPVIEW_DID}#bsky_appview`;
@@ -46,7 +45,8 @@ describe('XRPC proxy authentication', () => {
     userDid = process.env.PDS_DID.trim();
 
     server = http.createServer(app);
-    await new Promise((resolve) => server.listen(PORT, resolve));
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    PDS_URL = `http://127.0.0.1:${server.address().port}`;
 
     const login = await axios.post(`${PDS_URL}/xrpc/com.atproto.server.createSession`, {
       identifier: 'localhost.test',

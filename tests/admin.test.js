@@ -12,8 +12,7 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PORT = 3012;
-const HOST = `http://localhost:${PORT}`;
+let HOST;
 const PASSWORD = 'admin-test-password';
 
 describe('Admin Interface', () => {
@@ -32,7 +31,8 @@ describe('Admin Interface', () => {
     await setUpRepo();
 
     server = http.createServer(app);
-    await new Promise((resolve) => server.listen(PORT, resolve));
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    HOST = `http://127.0.0.1:${server.address().port}`;
   });
 
   afterAll(async () => {

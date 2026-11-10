@@ -62,9 +62,19 @@ async function resolveDomainHandle(handle) {
   diagnostics.push({ source: 'DNS TXT', name: dnsName, dids: dns });
   const document = await wellKnownDid(handle, '/.well-known/handle', true);
   diagnostics.push({ source: 'HTTPS well-known', ...document });
+  if (document.status === 'hostname not resolvable') {
+    diagnostics.push({ source: 'AT Protocol fallback', status: 'not attempted', reason: 'Section 6.4 permits fallback after a 404/410 or a document without a recognized DID, not after an HTTPS lookup failure.' });
+    const error = new Error('The modern handle well-known lookup failed because the hostname could not be resolved; legacy fallback is not permitted by Section 6.4.');
+    error.resolutionDiagnostics = diagnostics;
+    throw error;
+  }
   const currentDids = [...new Set([...dns, ...(document.did ? [document.did] : [])])];
   if (currentDids.length > 1) throw new Error('Handle resolution produced conflicting DIDs.');
-  if (currentDids.length === 1) return { did: currentDids[0], diagnostics, method: dns.length ? 'DNS TXT _handle' : 'HTTPS /.well-known/handle' };
+  if (currentDids.length === 1) {
+    diagnostics.push({ source: 'AT Protocol fallback', status: 'skipped', reason: 'The current ecosystem-neutral lookups resolved a DID; Section 6.4.1 fallback is conditional.' });
+    return { did: currentDids[0], diagnostics, method: dns.length ? 'DNS TXT _handle' : 'HTTPS /.well-known/handle' };
+  }
+  diagnostics.push({ source: 'AT Protocol fallback', status: 'used', reason: 'The current lookups returned no DID, so Section 6.4.1 compatibility lookups were performed.' });
   const atprotoName = `_atproto.${handle}`;
   const atprotoDns = await dnsDids(atprotoName, 'did');
   diagnostics.push({ source: 'Legacy DNS TXT', name: atprotoName, dids: atprotoDns });
@@ -76,7 +86,13 @@ async function resolveDomainHandle(handle) {
 }
 
 async function validateResolvedHandle(handle, sub, issuer) {
-  const resolution = await resolveDomainHandle(handle);
+  let resolution;
+  try {
+    resolution = await resolveDomainHandle(handle);
+  } catch (error) {
+    error.resolutionDiagnostics ||= [];
+    throw error;
+  }
   if (resolution.did !== sub) throw new Error('Handle resolution did not match the requested account DID.');
   if (!/^did:plc:[a-z2-7]{24}$/.test(sub)) throw new Error('Only did:plc accounts are supported by this PDS issuer.');
   const response = await axios.get(`${PLC_DIRECTORY}/${encodeURIComponent(sub)}`, { timeout: 5000 });
@@ -99,8 +115,12 @@ async function validateResolvedHandle(handle, sub, issuer) {
   };
 }
 
-function addStep(steps, name, summary, details) {
-  steps.push({ name, ok: true, summary, details });
+function addStep(steps, name, summary, details, spec = {}) {
+  steps.push({ name, ok: true, status: 'pass', summary, details, ...spec });
+}
+
+function addFailedStep(steps, name, summary, details, spec = {}) {
+  steps.push({ name, ok: false, status: 'fail', summary, details, ...spec });
 }
 
 async function runLiveHvpSelfCheck(req, steps) {
@@ -130,7 +150,7 @@ async function runLiveHvpSelfCheck(req, steps) {
     { label: 'jwks_uri', value: jwksUrl.href, sameOrigin: jwksUrl.origin === issuer },
     { label: 'signing_alg_values_supported', value: metadata.signing_alg_values_supported },
     { label: 'federations', value: metadata.federations || [] },
-  ]);
+  ], { phase: 'setup', specLabel: 'Section 7.2 · Issuer Metadata', specUrl: 'https://code.sgo.to/handle-verification/draft-goto-handle-verification.html#issuer-metadata' });
 
   const jwksResponse = await http.get(jwksUrl.href);
   const keys = jwksResponse.data?.keys;
@@ -139,7 +159,7 @@ async function runLiveHvpSelfCheck(req, steps) {
     { label: 'GET', value: jwksUrl.href },
     { label: 'HTTP status', value: jwksResponse.status },
     { label: 'keys', value: keys.map(({ kid, kty, crv, alg, use }) => ({ kid, kty, crv, alg, use })) },
-  ]);
+  ], { phase: 'setup', specLabel: 'Sections 7.2 and 8.3.2.6 · Issuer keys', specUrl: 'https://code.sgo.to/handle-verification/draft-goto-handle-verification.html#hvt-verification' });
 
   const { privateKey: holderPrivateKey, publicKey: holderPublicKey } = generateKeyPairSync('ed25519');
   const exportedHolderKey = holderPublicKey.export({ format: 'jwk' });
@@ -204,7 +224,7 @@ async function runLiveHvpSelfCheck(req, steps) {
     { label: 'HTTP response status', value: issuanceResponse.status },
     { label: 'issuance token format', value: 'SD-JWT with trailing ~' },
     { label: 'HVT', value: issuanceToken },
-  ]);
+  ], { phase: 'setup', specLabel: 'Section 7.3 · HVT Request', specUrl: 'https://code.sgo.to/handle-verification/draft-goto-handle-verification.html#token-request-details' });
 
   const hvtParts = issuanceToken.slice(0, -1).split('.');
   if (hvtParts.length !== 3) throw new Error('The issuer returned a malformed HVT.');
@@ -216,34 +236,6 @@ async function runLiveHvpSelfCheck(req, steps) {
   } catch {
     throw new Error('The issuer returned malformed HVT claims.');
   }
-  const signingKey = keys.find((key) => key.kid === hvtHeader.kid);
-  if (!signingKey || signingKey.kty !== 'OKP' || signingKey.crv !== 'Ed25519' || signingKey.alg !== 'Ed25519' || hvtHeader.alg !== 'Ed25519' || hvtHeader.typ !== 'hvt+jwt') {
-    throw new Error('HVT header does not match an advertised Ed25519 JWKS key.');
-  }
-  const issuerPublicKey = createPublicKey({ key: { kty: signingKey.kty, crv: signingKey.crv, x: signingKey.x }, format: 'jwk' });
-  const issuerSignature = Buffer.from(hvtParts[2], 'base64url');
-  if (!cryptoVerify(null, Buffer.from(`${hvtParts[0]}.${hvtParts[1]}`), issuerPublicKey, issuerSignature)) {
-    throw new Error('HVT signature did not verify against the issuer JWKS.');
-  }
-  if (hvtPayload.iss !== issuer || hvtPayload.handle !== handle || hvtPayload.sub !== did || !Number.isSafeInteger(hvtPayload.iat) || Math.abs(Date.now() / 1000 - hvtPayload.iat) > 300) {
-    throw new Error('HVT claims do not match the configured issuer, handle, DID, or acceptable issue time.');
-  }
-  if (!hvtPayload.cnf?.jwk || ['kty', 'crv', 'x', 'alg'].some((name) => hvtPayload.cnf.jwk[name] !== holderJwk[name])) {
-    throw new Error('HVT confirmation key does not match the simulated holder key.');
-  }
-  addStep(steps, 'HVT signature and claims', 'The HVT signature verifies against the advertised issuer key, and its claims match this account and the simulated holder key.', [
-    { label: 'HVT header', value: hvtHeader },
-    { label: 'HVT claims', value: hvtPayload },
-    { label: 'JWKS key selected', value: { kid: signingKey.kid, kty: signingKey.kty, crv: signingKey.crv, alg: signingKey.alg } },
-    { label: 'issuer signature', value: 'PASS (Ed25519)' },
-    { label: 'iss matches configured issuer', value: hvtPayload.iss === issuer },
-    { label: 'handle matches account', value: hvtPayload.handle === handle },
-    { label: 'sub matches account DID', value: hvtPayload.sub === did },
-    { label: 'iat within 300 seconds', value: true },
-    { label: 'cnf.jwk matches generated holder key', value: true },
-    { label: 'simulated holder public JWK', value: holderJwk },
-    { label: 'HVT', value: issuanceToken },
-  ]);
 
   const verifierOrigin = 'https://hvp-self-check.invalid';
   const nonce = randomBytes(16).toString('base64url');
@@ -256,41 +248,119 @@ async function runLiveHvpSelfCheck(req, steps) {
   const kbHeader = { alg: holderJwk.alg, typ: 'kb+jwt' };
   const kbInput = `${Buffer.from(JSON.stringify(kbHeader)).toString('base64url')}.${Buffer.from(JSON.stringify(kbPayload)).toString('base64url')}`;
   const kbSignature = cryptoSign(null, Buffer.from(kbInput), holderPrivateKey).toString('base64url');
-  const presented = `${issuanceToken.slice(0, -1)}~${kbInput}.${kbSignature}`;
-  const [presentedHvt, presentedKb] = presented.split('~');
-  const kbParts = presentedKb.split('.');
+  const hvtKbToken = `${issuanceToken}${kbInput}.${kbSignature}`;
+  const kbParts = `${kbInput}.${kbSignature}`.split('.');
   const kb = {
     header: JSON.parse(Buffer.from(kbParts[0], 'base64url').toString()),
     payload: JSON.parse(Buffer.from(kbParts[1], 'base64url').toString()),
     signingInput: Buffer.from(`${kbParts[0]}.${kbParts[1]}`),
     signature: Buffer.from(kbParts[2], 'base64url'),
   };
-  const holderVerifyKey = createPublicKey({ key: { kty: holderJwk.kty, crv: holderJwk.crv, x: holderJwk.x }, format: 'jwk' });
-  const expectedSdHash = createHash('sha256').update(`${presentedHvt}~`).digest('base64url');
-  const kbChecks = {
-    algorithmMatchesConfirmationKey: kb.header.alg === hvtPayload.cnf.jwk.alg,
+  const expectedSdHash = createHash('sha256').update(issuanceToken).digest('base64url');
+
+  // Section 10, step 1: check the KB-JWT claims before its signature.
+  const kbClaimChecks = {
+    algorithmMatchesConfirmationKey: kb.header.alg === hvtPayload.cnf?.jwk?.alg,
     typeIsKeyBindingJwt: kb.header.typ === 'kb+jwt',
     audienceMatchesVerifier: kb.payload.aud === verifierOrigin,
     nonceMatches: kb.payload.nonce === nonce,
     sdHashMatchesHvt: kb.payload.sd_hash === expectedSdHash,
-    issueTimeWithin300Seconds: Math.abs(Date.now() / 1000 - kb.payload.iat) <= 300,
-    holderSignatureValid: cryptoVerify(null, kb.signingInput, holderVerifyKey, kb.signature),
+    issueTimeWithin300Seconds: Number.isSafeInteger(kb.payload.iat) && Math.abs(Date.now() / 1000 - kb.payload.iat) <= 300,
   };
-  if (Object.values(kbChecks).some((passed) => !passed)) {
-    throw new Error('Simulated verifier rejected the holder key-binding JWT.');
+  if (Object.values(kbClaimChecks).some((passed) => !passed)) {
+    addFailedStep(steps, 'KB-JWT claims', 'One or more KB-JWT claims do not match the verifier session or HVT.', [
+      { label: 'KB-JWT header', value: kb.header },
+      { label: 'KB-JWT claims', value: kb.payload },
+      { label: 'claim checks', value: kbClaimChecks },
+      { label: 'expected audience', value: verifierOrigin },
+      { label: 'expected nonce', value: nonce },
+      { label: 'expected sd_hash', value: expectedSdHash },
+    ], { phase: 'verifier', sequence: 1, specLabel: 'Section 10.2.1 · Verify KB-JWT claims', specUrl: 'https://code.sgo.to/handle-verification/draft-goto-handle-verification.html#section-10-2.1' });
+    throw new Error('Simulated verifier rejected the KB-JWT claims.');
   }
-  const hvtKbToken = `${issuanceToken}${kbInput}.${kbSignature}`;
-  addStep(steps, 'HVT+KB holder proof', 'The simulated verifier accepts the key-binding JWT for this HVT.', [
+  addStep(steps, 'KB-JWT claims', 'The KB-JWT algorithm, verifier audience, session nonce, issue time, and HVT hash all match.', [
     { label: 'KB-JWT header', value: kb.header },
     { label: 'KB-JWT claims', value: kb.payload },
-    { label: 'verification checks', value: kbChecks },
-    { label: 'sd_hash expected', value: expectedSdHash },
-    { label: 'sd_hash actual', value: kb.payload.sd_hash },
-    { label: 'HVT+KB', value: hvtKbToken },
-  ]);
+    { label: 'claim checks', value: kbClaimChecks },
+    { label: 'expected audience', value: verifierOrigin },
+    { label: 'expected nonce', value: nonce },
+    { label: 'expected sd_hash', value: expectedSdHash },
+    { label: 'HVT+KB token', value: hvtKbToken },
+  ], { phase: 'verifier', sequence: 1, specLabel: 'Section 10.2.1 · Verify KB-JWT claims', specUrl: 'https://code.sgo.to/handle-verification/draft-goto-handle-verification.html#section-10-2.1' });
 
-  const resolution = await validateResolvedHandle(handle, did, issuer);
-  addStep(steps, 'Verifier handle resolution', `The handle resolves to the account DID through ${resolution.method}; the DID back-link and issuer service match.`, resolution.details.map((entry) => ({ label: entry.source, value: entry })));
+  // Section 10, step 2: apply Section 8.3 to the HVT, including fresh handle resolution.
+  const hvtChecks = {
+    typeIsHvtJwt: hvtHeader.typ === 'hvt+jwt',
+    algorithmIsEd25519: hvtHeader.alg === 'Ed25519',
+    issuerMatchesMetadataIssuer: hvtPayload.iss === issuer,
+    handleIsNormalizedAndMatchesAccount: validDomainHandle(hvtPayload.handle) && hvtPayload.handle === handle,
+    subMatchesAccountDid: hvtPayload.sub === did,
+    issueTimeWithin300Seconds: Number.isSafeInteger(hvtPayload.iat) && Math.abs(Date.now() / 1000 - hvtPayload.iat) <= 300,
+    confirmationKeyMatchesHolderKey: Boolean(hvtPayload.cnf?.jwk) && ['kty', 'crv', 'x', 'alg'].every((name) => hvtPayload.cnf.jwk[name] === holderJwk[name]),
+  };
+  let resolution;
+  let signingKey;
+  let hvtSignatureValid = false;
+  try {
+    if (Object.values(hvtChecks).some((passed) => !passed)) throw new Error('One or more HVT header or claim checks failed.');
+    resolution = await validateResolvedHandle(hvtPayload.handle, hvtPayload.sub, hvtPayload.iss);
+    signingKey = keys.find((key) => key.kid === hvtHeader.kid);
+    hvtChecks.kidFoundInJwks = Boolean(signingKey);
+    hvtChecks.jwksKeyIsEd25519 = Boolean(signingKey && signingKey.kty === 'OKP' && signingKey.crv === 'Ed25519' && signingKey.alg === 'Ed25519');
+    if (!signingKey || !hvtChecks.jwksKeyIsEd25519) throw new Error('HVT kid does not identify an advertised Ed25519 JWKS key.');
+    const issuerPublicKey = createPublicKey({ key: { kty: signingKey.kty, crv: signingKey.crv, x: signingKey.x }, format: 'jwk' });
+    hvtSignatureValid = cryptoVerify(null, Buffer.from(`${hvtParts[0]}.${hvtParts[1]}`), issuerPublicKey, Buffer.from(hvtParts[2], 'base64url'));
+    if (!hvtSignatureValid) throw new Error('HVT signature did not verify against the issuer JWKS.');
+  } catch (error) {
+    addFailedStep(steps, 'HVT and handle resolution', error.message, [
+      { label: 'HVT header', value: hvtHeader },
+      { label: 'HVT claims', value: hvtPayload },
+      { label: 'HVT checks', value: hvtChecks },
+      { label: 'issuer metadata used', value: `${issuer}/.well-known/handle-verification` },
+      { label: 'JWKS URL used', value: jwksUrl.href },
+      { label: 'resolution diagnostics', value: error.resolutionDiagnostics || [] },
+      { label: 'HVT', value: issuanceToken },
+    ], { phase: 'verifier', sequence: 2, specRefs: [
+      { label: 'Section 10.2.2 · Verify HVT', url: 'https://code.sgo.to/handle-verification/draft-goto-handle-verification.html#section-10-2.2' },
+      { label: 'Section 8.3 · HVT verification', url: 'https://code.sgo.to/handle-verification/draft-goto-handle-verification.html#hvt-verification' },
+      { label: 'Section 6.4 · Handle resolution', url: 'https://code.sgo.to/handle-verification/draft-goto-handle-verification.html#resolution-steps' },
+      { label: 'Section 5.2 · Authorized service', url: 'https://code.sgo.to/handle-verification/draft-goto-handle-verification.html#handle-verification-service' },
+    ] });
+    throw error;
+  }
+  addStep(steps, 'HVT and handle resolution', 'The HVT header, claims, issuer signature, and fresh handle-to-DID resolution pass.', [
+    { label: 'HVT header', value: hvtHeader },
+    { label: 'HVT claims', value: hvtPayload },
+    { label: 'HVT checks', value: hvtChecks },
+    { label: 'JWKS key selected', value: { kid: signingKey.kid, kty: signingKey.kty, crv: signingKey.crv, alg: signingKey.alg } },
+    { label: 'HVT signature', value: hvtSignatureValid ? 'PASS (Ed25519)' : 'FAIL' },
+    { label: 'resolution evidence', value: resolution.details },
+    { label: 'HVT', value: issuanceToken },
+  ], { phase: 'verifier', sequence: 2, specRefs: [
+    { label: 'Section 10.2.2 · Verify HVT', url: 'https://code.sgo.to/handle-verification/draft-goto-handle-verification.html#section-10-2.2' },
+    { label: 'Section 8.3 · HVT verification', url: 'https://code.sgo.to/handle-verification/draft-goto-handle-verification.html#hvt-verification' },
+    { label: 'Section 6.4 · Handle resolution', url: 'https://code.sgo.to/handle-verification/draft-goto-handle-verification.html#resolution-steps' },
+    { label: 'Section 5.2 · Authorized service', url: 'https://code.sgo.to/handle-verification/draft-goto-handle-verification.html#handle-verification-service' },
+  ] });
+
+  // Section 10, step 3: verify the KB-JWT signature with the HVT cnf.jwk.
+  const cnfJwk = hvtPayload.cnf.jwk;
+  const holderVerifyKey = createPublicKey({ key: { kty: cnfJwk.kty, crv: cnfJwk.crv, x: cnfJwk.x }, format: 'jwk' });
+  const kbSignatureValid = cryptoVerify(null, kb.signingInput, holderVerifyKey, kb.signature);
+  if (!kbSignatureValid) {
+    addFailedStep(steps, 'KB-JWT signature', 'The KB-JWT signature does not verify with the public key in HVT cnf.jwk.', [
+      { label: 'cnf.jwk', value: cnfJwk },
+      { label: 'signature valid', value: false },
+      { label: 'HVT+KB token', value: hvtKbToken },
+    ], { phase: 'verifier', sequence: 3, specLabel: 'Section 10.2.3 · Verify KB-JWT signature', specUrl: 'https://code.sgo.to/handle-verification/draft-goto-handle-verification.html#section-10-2.3' });
+    throw new Error('Simulated verifier rejected the KB-JWT signature.');
+  }
+  addStep(steps, 'KB-JWT signature', 'The KB-JWT signature verifies with the public key from HVT cnf.jwk.', [
+    { label: 'cnf.jwk', value: cnfJwk },
+    { label: 'signature valid', value: true },
+    { label: 'KB-JWT', value: `${kbInput}.${kbSignature}` },
+    { label: 'HVT+KB token', value: hvtKbToken },
+  ], { phase: 'verifier', sequence: 3, specLabel: 'Section 10.2.3 · Verify KB-JWT signature', specUrl: 'https://code.sgo.to/handle-verification/draft-goto-handle-verification.html#section-10-2.3' });
 }
 
 export async function runHvpSelfCheck(req) {
@@ -317,14 +387,34 @@ function formatDetail(value) {
 }
 
 export function renderHvpSelfCheckHtml({ success, handle, did, issuer, steps = [], error = '' }) {
-  const resultMarkup = steps.map((step) => `
-    <section class="step ${step.ok ? 'pass' : 'fail'}">
-      <h2><span>${step.ok ? 'PASS' : 'FAIL'}</span> ${escapeHtml(step.name)}</h2>
+  const renderStep = (step) => `
+    <section class="step ${escapeHtml((step.status || (step.ok ? 'pass' : 'fail')).replaceAll(' ', '-'))}">
+      <h3><span>${escapeHtml((step.status || (step.ok ? 'pass' : 'fail')).toUpperCase())}</span> ${escapeHtml(step.sequence ? `Step ${step.sequence} · ` : '')}${escapeHtml(step.name)}</h3>
       <p>${escapeHtml(step.summary || step.detail || '')}</p>
+      ${(step.specRefs || (step.specUrl ? [{ label: step.specLabel || 'Draft reference', url: step.specUrl }] : [])).length ? `<p class="spec-ref">${(step.specRefs || [{ label: step.specLabel || 'Draft reference', url: step.specUrl }]).map((reference) => `<a href="${escapeHtml(reference.url)}" target="_blank" rel="noopener noreferrer">${escapeHtml(reference.label)}</a>`).join(' · ')}</p>` : ''}
       ${step.details?.length ? `<dl>${step.details.map(({ label, value }) => `
         <dt>${escapeHtml(label)}</dt><dd><pre>${escapeHtml(formatDetail(value))}</pre></dd>
       `).join('')}</dl>` : ''}
-    </section>`).join('');
+    </section>`;
+  const setupSteps = steps.filter((step) => step.phase !== 'verifier');
+  const verifierSteps = steps.filter((step) => step.phase === 'verifier').sort((a, b) => a.sequence - b.sequence);
+  const firstFailedSequence = verifierSteps.find((step) => step.status === 'fail')?.sequence;
+  if (firstFailedSequence) {
+    for (let sequence = firstFailedSequence + 1; sequence <= 3; sequence += 1) {
+      if (!verifierSteps.some((step) => step.sequence === sequence)) {
+        verifierSteps.push({
+          phase: 'verifier', sequence, status: 'not run', ok: false,
+          name: sequence === 3 ? 'KB-JWT signature' : 'Verification step',
+          summary: `Not run because verifier step ${firstFailedSequence} failed.`,
+          specLabel: `Section 10.2.${sequence} · Verification sequence`,
+          specUrl: `https://code.sgo.to/handle-verification/draft-goto-handle-verification.html#section-10-2.${sequence}`,
+        });
+      }
+    }
+    verifierSteps.sort((a, b) => a.sequence - b.sequence);
+  }
+  const setupMarkup = setupSteps.map(renderStep).join('');
+  const verifierMarkup = verifierSteps.map(renderStep).join('');
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -337,8 +427,10 @@ export function renderHvpSelfCheckHtml({ success, handle, did, issuer, steps = [
     h1 { margin-bottom: .25rem; }
     .identity, .summary { color: #777; overflow-wrap: anywhere; }
     .step { margin: 1rem 0; padding: 1rem 1.25rem; border: 1px solid #7776; border-radius: .75rem; }
-    .step h2 { margin: 0; font-size: 1.15rem; }
-    .pass h2 span { color: #17803d; } .fail h2 span, .error { color: #c33; }
+    .step h3 { margin: 0; font-size: 1.15rem; }
+    .pass h3 span { color: #17803d; } .fail h3 span, .error { color: #c33; }
+    .skipped h3 span, .not-run h3 span { color: #997000; }
+    .spec-ref { margin: .5rem 0; font-size: .9rem; }
     dl { display: grid; grid-template-columns: minmax(150px, 220px) minmax(0, 1fr); gap: .5rem 1rem; }
     dt { font-weight: 650; } dd { margin: 0; min-width: 0; }
     pre { margin: 0; padding: .65rem; white-space: pre-wrap; overflow-wrap: anywhere; background: #7771; border-radius: .35rem; }
@@ -352,7 +444,12 @@ export function renderHvpSelfCheckHtml({ success, handle, did, issuer, steps = [
   <p class="identity">Handle: <strong>${escapeHtml(handle || 'unknown')}</strong><br>DID: <code>${escapeHtml(did || 'unknown')}</code><br>Issuer: <code>${escapeHtml(issuer || 'unknown')}</code></p>
   <h2 class="${success ? 'pass' : 'error'}">${success ? 'All checks passed' : 'Self-check failed'}</h2>
   ${error ? `<p class="error">${escapeHtml(error)}</p>` : ''}
-  ${resultMarkup || '<p>No verification steps completed.</p>'}
+  <h2>Setup and HVT issuance</h2>
+  <p>These operations prepare the HVT and supporting issuer data used by the verifier sequence below.</p>
+  ${setupMarkup || '<p>No setup steps completed.</p>'}
+  <h2>Verifier sequence · Section 10</h2>
+  <p>The checks below follow the draft’s numbered HVT+KB verification procedure.</p>
+  ${verifierMarkup || '<p>No verifier steps completed.</p>'}
   <p class="summary">The report includes the simulated HVT and HVT+KB tokens. It redacts the session cookie and never includes the holder private key.</p>
   <div class="actions"><a href="/">Return to admin dashboard</a></div>
 </body>
